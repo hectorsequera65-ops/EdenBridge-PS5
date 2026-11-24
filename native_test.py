@@ -74,6 +74,10 @@ def check(path, port):
     for referer in (None, ORIGIN + ".example/", "https://other.test/"):
         assert "data-auto='0'" in request("GET", prepare, 200, referer=referer)
     assert "data-auto='1'" in request("GET", prepare, 200, referer=self_origin + "/")
+    rooms_origin = "https://eden-rooms.pages.dev"
+    assert "data-auto='1'" in request("GET", prepare, 200, referer=rooms_origin + "/")
+    for referer in (rooms_origin + ".example/", rooms_origin + "/other", "http://eden-rooms.pages.dev/"):
+        assert "data-auto='0'" in request("GET", prepare, 200, referer=referer)
     page = request("GET", prepare, 200, referer=ORIGIN + "/")
     assert "data-auto='1'" in page
     token = re.search(r"name='confirm' value='([a-f0-9]{32})'", page)[1]

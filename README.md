@@ -2,19 +2,20 @@
 
 Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y los guarda en la configuración de ProsperoEden. La versión C experimental se compila con un SDK de payloads para PS5. El arranque, las notificaciones y la escritura en una consola física están pendientes de prueba.
 
-- [Versión experimental v0.2.0-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.2.0-experimental)
+- [Versión experimental v0.3.1-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.1-experimental)
+- [Versiones anteriores](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases)
 - [ELF original v0.1.0-original](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.1.0-original)
 
 ## Flujo de Eden Rooms
 
 1. En una PS5 de pruebas con un cargador ELF compatible, iniciá el payload y anotá la IP mostrada en la notificación. El servicio escucha en IPv4 en el puerto TCP **24879**. Usalo en una red privada de confianza.
 2. Cerrá ProsperoEden antes de enviar. En Eden Rooms, seleccioná una sala e ingresá la IP de la PS5 y tu apodo. El botón **Enviar a PS5** de [Eden Rooms](https://eden-rooms.pages.dev/) abre `/v1/prepare?host=...&port=...&nick=...` en una ventana del puente. También podés ingresar los datos desde `http://IP-DE-LA-PS5:24879/`.
-3. El puente valida los datos y guarda automáticamente si puede verificar el origen. Eden Rooms autoriza el guardado por mensajería entre ventanas aunque falte el encabezado `Referer`. Si el navegador bloquea la ventana emergente o la comunicación, **Confirmar sala** permite guardar manualmente. El formulario local también admite guardado automático.
+3. El puente valida los datos y guarda automáticamente si puede verificar el origen. Para la navegación del botón de envío, Eden Rooms pide al navegador que incluya únicamente su origen en `Referer`, incluso al pasar de HTTPS al HTTP de la consola. Si el navegador omite `Referer`, Eden Rooms puede autorizar el guardado por mensajería entre ventanas. Cuando el navegador bloquea la ventana emergente o el puente carece de una señal de origen válida, **Confirmar sala** permite guardar manualmente. El formulario local también admite guardado automático.
 4. Una vez confirmada la escritura, aparece **Sala guardada correctamente**. El puente intenta cerrar la ventana un segundo después. Si el navegador bloquea el cierre, podés cerrar la pestaña o usar **volver a Eden Rooms**. Si falla el guardado, la página queda abierta con el motivo y **Reintentar**. Luego abrí ProsperoEden y comprobá los datos.
 
 Eden Rooms puede navegar en la pestaña actual. Los navegadores suelen permitir el cierre por JavaScript de ventanas abiertas por contenido web y pueden impedirlo en una pestaña con historial de navegación. [Comportamiento de Window.close en MDN](https://developer.mozilla.org/en-US/docs/Web/API/Window/close)
 
-El puente comprueba que `postMessage` proviene de la ventana que lo abrió, que el origen informado por el navegador es exactamente `https://eden-rooms.pages.dev` y que la sala coincide con el formulario. Eden Rooms responde solo a la ventana que abrió y al origen HTTP de la PS5 ingresada. El puente conserva la validación del POST local y su token de confirmación. [Mensajería entre ventanas en HTML](https://html.spec.whatwg.org/multipage/web-messaging.html#crossDocumentMessages)
+Para identificar una navegación de Eden Rooms sin `window.opener`, el puente exige que `Referer` sea exactamente `https://eden-rooms.pages.dev/`. Para autorizar por `postMessage`, comprueba que el mensaje viene de la ventana que lo abrió, que el origen es exactamente `https://eden-rooms.pages.dev` y que la sala coincide con el formulario. Eden Rooms responde solo a la ventana que abrió y al origen HTTP de la PS5 ingresada. Ambas vías requieren el POST local y su token de confirmación. [Mensajería entre ventanas en HTML](https://html.spec.whatwg.org/multipage/web-messaging.html#crossDocumentMessages)
 
 La confirmación exige una solicitud del mismo origen y un token aleatorio por formulario. El puente conserva los resultados de los 64 formularios más recientes para que un reintento del mismo formulario tras perder la respuesta no repita la escritura, el respaldo ni la notificación. El servidor comprueba `Host` contra la dirección local de la conexión. Los POST JSON de otro origen se limitan a `https://eden-rooms-ps5.pages.dev`. La validación de origen protege el flujo de navegador. El tráfico HTTP del puente requiere una LAN de confianza. Los equipos con acceso directo a esa red pueden enviar solicitudes HTTP sin las restricciones del navegador.
 

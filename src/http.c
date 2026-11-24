@@ -465,7 +465,8 @@ static void serve(int fd)
                   "<form action='/'><button>Reintentar</button></form></html>", PAGE, 0);
             return;
         }
-        int automatic = local || external || referred_by(req.referer, ORIGIN) ||
+        int from_rooms = req.referer && !strcmp(req.referer, ROOMS_ORIGIN "/");
+        int automatic = local || external || from_rooms || referred_by(req.referer, ORIGIN) ||
                         referred_by(req.referer, self);
         const char *message = !*room.nick ? "Ingresá tu apodo para continuar." :
                               automatic ? "Preparando el guardado…" :
@@ -479,9 +480,10 @@ static void serve(int fd)
             "<button disabled>Confirmar sala</button></form>"
             "<noscript><p>Activá JavaScript y volvé a abrir la sala.</p></noscript>"
             "<p id='back' hidden>Podés cerrar esta pestaña o "
-            "<a href='" ORIGIN "/'>volver a Eden Rooms</a>.</p>"
+            "<a href='%s/'>volver a Eden Rooms</a>.</p>"
             "<script src='/save.js' defer></script></html>",
-            room.host, room.port, message, automatic, room.host, room.port, new_submission(), room.nick);
+            room.host, room.port, message, automatic, room.host, room.port, new_submission(), room.nick,
+            from_rooms ? ROOMS_ORIGIN : ORIGIN);
         reply(fd, 200, body, PAGE, 0);
         return;
     }
