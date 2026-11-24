@@ -2,20 +2,19 @@
 
 Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y los guarda en la configuración de ProsperoEden. La versión C experimental se compila con un SDK de payloads para PS5. El ELF de esta versión se compiló para PS5 y el guardado se verificó con configuraciones temporales en Linux.
 
-- [Versión experimental v0.3.3-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.3-experimental)
+- [Versión experimental v0.3.4-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.4-experimental)
 - [Versiones anteriores](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases)
 - [ELF original v0.1.0-original](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.1.0-original)
 
 ## Flujo de Eden Rooms
 
 1. En una PS5 de pruebas con un cargador ELF compatible, iniciá el payload y anotá la IP mostrada en la notificación. El servicio escucha en IPv4 en el puerto TCP **24879**. Usalo en una red privada de confianza.
-2. Cerrá ProsperoEden antes de enviar. En Eden Rooms, seleccioná una sala e ingresá la IP de la PS5 y tu apodo. El botón **Enviar a PS5** de [Eden Rooms](https://eden-rooms.pages.dev/) abre `/v1/prepare?host=...&port=...&nick=...` en una ventana del puente. También podés ingresar los datos desde `http://IP-DE-LA-PS5:24879/`.
-3. El puente valida los datos y guarda automáticamente si puede verificar el origen. Para la navegación del botón de envío, Eden Rooms pide al navegador que incluya únicamente su origen en `Referer`, incluso al pasar de HTTPS al HTTP de la consola. Si el navegador omite `Referer`, Eden Rooms puede autorizar el guardado por mensajería entre ventanas. Cuando el navegador bloquea la ventana emergente o el puente carece de una señal de origen válida, **Confirmar sala** permite guardar manualmente. El formulario local también admite guardado automático.
-4. Una vez confirmada la escritura, aparece **Sala guardada correctamente**. El puente intenta cerrar la ventana de inmediato y envía a Eden Rooms una confirmación con los datos de la sala para que también pueda cerrarla. Si el navegador bloquea el cierre, podés cerrar la pestaña o usar **volver a Eden Rooms**. Si falla el guardado, la página queda abierta con el motivo y **Reintentar**. Luego abrí ProsperoEden y comprobá los datos.
+2. Cerrá ProsperoEden antes de enviar. Seleccioná una sala en [Eden Rooms](https://eden-rooms.pages.dev/), ingresá la IP de la PS5 y tu apodo, y pulsá **Enviar a PS5** una vez.
+3. La misma pestaña abre el puente y vuelve automáticamente a Eden Rooms cuando el puente confirma que guardó la sala. Si falla el guardado, el puente muestra el motivo y permite **Reintentar**. Después del guardado, abrí ProsperoEden para usar los nuevos datos.
 
-Eden Rooms puede navegar en la pestaña actual. Los navegadores suelen permitir el cierre por JavaScript de ventanas abiertas por contenido web y pueden impedirlo en una pestaña con historial de navegación. [Comportamiento de Window.close en MDN](https://developer.mozilla.org/en-US/docs/Web/API/Window/close)
+Eden Rooms registra una intención aleatoria en el almacenamiento de sesión de la pestaña antes de navegar al puente. El puente genera un código aleatorio ligado a la intención y a la IP, al puerto y al apodo de la sala. Devuelve el código a la URL fija de Eden Rooms, en el fragmento. Eden Rooms verifica la intención pendiente de esa pestaña antes de devolver el código al puente seleccionado. El puente acepta el guardado únicamente mediante un POST de su propio origen, con el código y los datos exactos. La autorización para el primer guardado vence a los cinco minutos. El flujo funciona cuando el navegador omite `Referer` y la pestaña carece de `window.opener`.
 
-Para identificar una navegación de Eden Rooms sin `window.opener`, el puente exige que `Referer` sea exactamente `https://eden-rooms.pages.dev/`. Para autorizar por `postMessage`, comprueba que el mensaje viene de la ventana que lo abrió, que el origen es exactamente `https://eden-rooms.pages.dev` y que la sala coincide con el formulario. Eden Rooms solo intercambia mensajes con la ventana que abrió y con el origen HTTP de la PS5 ingresada. Para aceptar una confirmación de guardado exige que coincidan la IP de la sala, el puerto y el apodo. Ambas vías requieren el POST local y su token de confirmación. [Mensajería entre ventanas en HTML](https://html.spec.whatwg.org/multipage/web-messaging.html#crossDocumentMessages)
+Para ingresar los datos directamente desde la red local, abrí `http://IP-DE-LA-PS5:24879/`.
 
 La confirmación exige una solicitud del mismo origen y un token aleatorio por formulario asociado a la IP y al puerto de la sala. Después del primer guardado, los reintentos deben incluir también el mismo apodo. El navegador reintenta una vez los fallos transitorios con los mismos datos. El puente conserva los resultados de los 64 formularios más recientes para que un reintento del mismo formulario tras perder la respuesta no repita la escritura, el respaldo ni la notificación. El servidor comprueba `Host` contra la dirección local de la conexión. Los POST JSON de otro origen se limitan a `https://eden-rooms-ps5.pages.dev`. La validación de origen protege el flujo de navegador. El tráfico HTTP del puente requiere una LAN de confianza. Los equipos con acceso directo a esa red pueden enviar solicitudes HTTP sin las restricciones del navegador.
 
@@ -24,6 +23,8 @@ La confirmación exige una solicitud del mismo origen y un token aleatorio por f
 | `GET /v1/health` | Estado del servicio. |
 | `GET /v1/version` | Identifica la versión activa y la plataforma (`ps5` o `linux`). |
 | `GET /v1/config-check` | Comprueba si el archivo coincide con una estructura de escritura admitida. |
+| `GET /v1/transfer` | Valida la sala y devuelve un código aleatorio al sitio fijo de Eden Rooms. |
+| `GET /v1/receive` | Prepara el guardado en la misma pestaña con el código devuelto por Eden Rooms. |
 | `GET /v1/prepare` | Valida la sala y presenta el formulario de guardado. Admite un apodo inicial opcional. |
 | `POST /v1/preview` con JSON | Valida y devuelve `saved: false`. Acepta `host`, `port` y opcionalmente `nick` o `nickname`. |
 | `POST /v1/connection` con `application/json` | Mantiene la vista previa del prototipo Python. |

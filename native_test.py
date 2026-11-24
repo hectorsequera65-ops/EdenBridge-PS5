@@ -29,7 +29,7 @@ def check(path, port):
     self_origin = f"http://127.0.0.1:{port}"
     backup = path.with_name(path.name + ".edenrooms.bak")
 
-    def request(method, route, status, *, origin=None, body=None, media=None, host=None, referer=None):
+    def request(method, route, status, *, origin=None, body=None, media=None, host=None, referer=None, response_header=None):
         headers = {}
         if origin is not None:
             headers["Origin"] = origin
@@ -47,14 +47,14 @@ def check(path, port):
             assert response.status == status, (method, route, response.status, data)
             expected_origin = ORIGIN if origin == ORIGIN and status != 403 and route != "/v1/prepare" else None
             assert response.getheader("Access-Control-Allow-Origin") == expected_origin
-            return data
+            return response.getheader(response_header) if response_header else data
         finally:
             with_connection.close()
 
     assert json.loads(request("GET", "/v1/health", 200))["service"] == "eden-bridge"
     version = json.loads(request("GET", "/v1/version", 200, origin=ORIGIN))
     assert version == {"ok": True, "service": "eden-bridge",
-                       "version": "v0.3.3-experimental", "platform": "linux"}
+                       "version": "v0.3.4-experimental", "platform": "linux"}
     request("GET", "/v1/version", 403, origin="https://other.test")
     request("GET", "/", 200)
     request("GET", "/", 403, host=f"rebind.test:{port}")
@@ -203,6 +203,27 @@ def check(path, port):
         assert all(json.loads(result.result())["saved"] is True for result in results)
     assert backup.read_text() == modern
     assert path.read_text() == json.dumps(current, indent=2) + "\n"
+
+    # Same-tab transfers require the challenge, intent and exact room, with no Referer.
+    intent = "a" * 32
+    transfer = "/v1/transfer?" + urlencode(dict(room, intent=intent))
+    request("GET", "/v1/transfer?" + urlencode(room), 400)
+    request("GET", transfer, 403, origin="https://other.test")
+    challenge = request("GET", transfer, 303, response_header="Location")
+    token = re.fullmatch(rf"{rooms_origin}/#eden-bridge-challenge={intent}\.([a-f0-9]{{32}})", challenge)[1]
+    receive = request("GET", "/v1/receive?" + urlencode(room), 200)
+    assert token not in receive and "data-transfer='1'" in receive
+    approved_room = dict(room, confirm=token, intent=intent)
+    request("POST", "/v1/preview", 403, media=media, body=urlencode(approved_room))
+    request("POST", "/v1/preview", 403, origin=self_origin, media=media,
+            body=urlencode(dict(approved_room, intent="b" * 32)))
+    request("POST", "/v1/preview", 409, origin=self_origin, media=media,
+            body=urlencode(dict(approved_room, nick="Distinto")))
+    assert backup.read_text() == modern
+    for _ in range(2):
+        assert json.loads(request("POST", "/v1/preview", 200, origin=self_origin,
+                                  media=media, body=urlencode(approved_room)))["saved"] is True
+    assert backup.read_text() == json.dumps(current, indent=2) + "\n"
 
     raw_headers = [
         b"Content-Type: application/json",

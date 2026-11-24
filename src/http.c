@@ -25,7 +25,8 @@
 #define MAX_HEADER 8192
 #define MAX_BODY 2048
 #define REQUEST_TIMEOUT_MS 5000
-#define VERSION "v0.3.3-experimental"
+#define VERSION "v0.3.4-experimental"
+#define TRANSFER_TIMEOUT_MS 300000
 #ifdef EDEN_PS5
 #define PLATFORM "ps5"
 #else
@@ -36,6 +37,8 @@
  * so a retry after a lost response cannot replay the write or notification. */
 static struct submission {
     char token[33];
+    char intent[33];
+    int64_t expires;
     struct room room;
     int result;
 } submissions[64];
@@ -294,9 +297,9 @@ static int room_valid(const struct room *room)
 }
 
 /* All accepted field values use URL-unreserved characters. */
-static int form(char *text, struct room *room, const char **token)
+static int form(char *text, struct room *room, const char **token, const char **intent)
 {
-    char *host = NULL, *port = NULL, *nick = NULL, *key = NULL;
+    char *host = NULL, *port = NULL, *nick = NULL, *key = NULL, *intent_value = NULL;
     while (*text) {
         char *next = strchr(text, '&');
         if (next)
@@ -314,6 +317,8 @@ static int form(char *text, struct room *room, const char **token)
             slot = &nick;
         else if (!strcmp(text, "confirm") && token)
             slot = &key;
+        else if (!strcmp(text, "intent") && intent)
+            slot = &intent_value;
         if (!slot || header_value(slot, value))
             return -1;
         if (!next)
@@ -330,14 +335,23 @@ static int form(char *text, struct room *room, const char **token)
         strcpy(room->nick, nick);
     if (token)
         *token = key;
+    if (intent)
+        *intent = intent_value;
     return 0;
 }
 
-static const char *new_submission(const struct room *room)
+static int valid_intent(const char *intent)
+{
+    return intent && strlen(intent) == 32 && strspn(intent, "0123456789abcdef") == 32;
+}
+
+static const char *new_submission(const struct room *room, const char *intent)
 {
     struct submission *entry = &submissions[next_submission];
     next_submission = (next_submission + 1) % (sizeof submissions / sizeof *submissions);
     entry->result = 0;
+    strcpy(entry->intent, intent ? intent : "");
+    entry->expires = intent ? monotonic_ms() + TRANSFER_TIMEOUT_MS : 0;
     entry->room = *room;
     unsigned char random[16];
     arc4random_buf(random, sizeof random);
@@ -360,6 +374,17 @@ static struct submission *find_submission(const char *token)
     return NULL;
 }
 
+static void transfer_challenge(int fd, const char *intent, const char *token)
+{
+    char response[512];
+    int size = snprintf(response, sizeof response,
+        "HTTP/1.1 303 See Other\r\nConnection: close\r\nCache-Control: no-store\r\n"
+        "Referrer-Policy: no-referrer\r\nContent-Length: 0\r\n"
+        "Location: " ROOMS_ORIGIN "/#eden-bridge-challenge=%s.%s\r\n\r\n", intent, token);
+    if (size > 0 && (size_t)size < sizeof response)
+        send_all(fd, response, (size_t)size);
+}
+
 static int referred_by(const char *referer, const char *origin)
 {
     size_t length = strlen(origin);
@@ -379,13 +404,26 @@ static const char save_script[] =
     "const status = document.getElementById('status');\n"
     "const button = form.querySelector('button');\n"
     "const back = document.getElementById('back');\n"
+    "const transfer = form.dataset.transfer === '1';\n"
     "const previous = history.state;\n"
+    "if (transfer && !previous) {\n"
+    "  const match = /^#([a-f0-9]{32})\\.([a-f0-9]{32})$/.exec(location.hash);\n"
+    "  if (!match) {\n"
+    "    status.textContent = 'Autorización inválida. Volvé a iniciar el envío desde Eden Rooms.';\n"
+    "    form.hidden = true;\n"
+    "    back.hidden = false;\n"
+    "  } else {\n"
+    "    form.elements.intent.value = match[1];\n"
+    "    form.elements.confirm.value = match[2];\n"
+    "  }\n"
+    "}\n"
     "if (previous && previous.confirm) {\n"
     "  form.elements.confirm.value = previous.confirm;\n"
     "  form.elements.nick.value = previous.nick;\n"
+    "  if (transfer) form.elements.intent.value = previous.intent;\n"
     "  form.elements.nick.readOnly = true;\n"
     "}\n"
-    "const opener = window.opener;\n"
+    "const opener = transfer ? null : window.opener;\n"
     "const roomsOrigin = '" ROOMS_ORIGIN "';\n"
     "let saving = false;\n"
     "async function submit(data) {\n"
@@ -413,10 +451,15 @@ static const char save_script[] =
     "  try {\n"
     "    const data = new URLSearchParams(new FormData(form));\n"
     "    form.elements.nick.readOnly = true;\n"
-    "    try { history.replaceState({confirm: data.get('confirm'), nick: data.get('nick')}, ''); } catch {}\n"
+    "    try { history.replaceState({confirm: data.get('confirm'), nick: data.get('nick'),\n"
+    "      intent: data.get('intent')}, '', location.pathname + location.search); } catch {}\n"
     "    await submit(data);\n"
     "    form.hidden = true;\n"
     "    status.textContent = 'Sala guardada correctamente';\n"
+    "    if (transfer) {\n"
+    "      location.replace(roomsOrigin + '/#eden-bridge-saved=' + data.get('intent') + '.' + data.get('confirm'));\n"
+    "      return;\n"
+    "    }\n"
     "    back.hidden = false;\n"
     "    if (opener) opener.postMessage({type: 'eden-bridge:saved', host: data.get('host'),\n"
     "      port: data.get('port'), nick: data.get('nick')}, roomsOrigin);\n"
@@ -428,13 +471,14 @@ static const char save_script[] =
     "    saving = false;\n"
     "    button.disabled = false;\n"
     "    button.textContent = 'Reintentar';\n"
+    "    if (transfer) back.hidden = false;\n"
     "  }\n"
     "}\n"
     "form.addEventListener('submit', event => { event.preventDefault(); save(); });\n"
-    "button.disabled = false;\n"
-    "if (form.dataset.auto === '1' && form.checkValidity()) {\n"
+    "button.disabled = form.hidden;\n"
+    "if (!form.hidden && form.dataset.auto === '1' && form.checkValidity()) {\n"
     "  save();\n"
-    "} else if (opener && form.checkValidity()) {\n"
+    "} else if (!transfer && opener && form.checkValidity()) {\n"
     "  function authorize(event) {\n"
     "    if (event.origin !== roomsOrigin || event.source !== opener ||\n"
     "        event.data?.type !== 'eden-bridge:send-room') return;\n"
@@ -552,31 +596,42 @@ static void serve(int fd)
         reply(fd, 200, save_script, SCRIPT, 0);
         return;
     }
-    if (!strcmp(req.method, "GET") && !strcmp(req.target, "/v1/prepare")) {
-        if (!query || form(query, &room, NULL) || !room_valid(&room)) {
+    int receive = !strcmp(req.target, "/v1/receive");
+    int transfer = !strcmp(req.target, "/v1/transfer");
+    if (!strcmp(req.method, "GET") && (receive || transfer || !strcmp(req.target, "/v1/prepare"))) {
+        const char *intent = NULL;
+        if (!query || form(query, &room, NULL, transfer ? &intent : NULL) || !room_valid(&room) ||
+            ((receive || transfer) && !*room.nick) || (transfer && !valid_intent(intent))) {
             reply(fd, 400, HTML "<p>IP, puerto o apodo inválido.</p>"
                   "<form action='/'><button>Reintentar</button></form></html>", PAGE, 0);
             return;
         }
+        if (transfer) {
+            transfer_challenge(fd, intent, new_submission(&room, intent));
+            return;
+        }
         int from_rooms = req.referer && !strcmp(req.referer, ROOMS_ORIGIN "/");
-        int automatic = local || external || from_rooms || referred_by(req.referer, ORIGIN) ||
+        int automatic = receive || local || external || from_rooms || referred_by(req.referer, ORIGIN) ||
                         referred_by(req.referer, self);
         const char *message = !*room.nick ? "Ingresá tu apodo para continuar." :
                               automatic ? "Preparando el guardado…" :
                               "El navegador no identificó el origen del envío. Confirmá la sala.";
         snprintf(body, sizeof body, HTML "<p>Sala <strong>%s:%d</strong></p>"
             "<p id='status' role='status'>%s</p>"
-            "<form id='room' data-auto='%d' method='post' action='/v1/preview'>"
+            "<form id='room' data-auto='%d' data-transfer='%d' method='post' action='/v1/preview'>"
             "<input type='hidden' name='host' value='%s'><input type='hidden' name='port' value='%d'>"
-            "<input type='hidden' name='confirm' value='%s'>"
+            "<input type='hidden' name='confirm' value='%s'>%s"
             "<label>Apodo <input name='nick' maxlength='24' pattern='[A-Za-z0-9_\\-]{1,24}' value='%s' required></label>"
-            "<button disabled>Confirmar sala</button></form>"
+            "<button disabled>%s</button></form>"
             "<noscript><p>Activá JavaScript y volvé a abrir la sala.</p></noscript>"
-            "<p id='back' hidden>Podés cerrar esta pestaña o "
-            "<a href='%s/'>volver a Eden Rooms</a>.</p>"
+            "<p id='back' hidden><a href='%s/'>%s</a></p>"
             "<script src='/save.js' defer></script></html>",
-            room.host, room.port, message, automatic, room.host, room.port, new_submission(&room), room.nick,
-            referred_by(req.referer, ORIGIN) ? ORIGIN : ROOMS_ORIGIN);
+            room.host, room.port, message, automatic, receive, room.host, room.port,
+            receive ? "" : new_submission(&room, NULL),
+            receive ? "<input type='hidden' name='intent'>" : "", room.nick,
+            receive ? "Reintentar" : "Confirmar sala",
+            !receive && referred_by(req.referer, ORIGIN) ? ORIGIN : ROOMS_ORIGIN,
+            receive ? "Iniciar un nuevo envío en Eden Rooms" : "Volver a Eden Rooms");
         reply(fd, 200, body, PAGE, 0);
         return;
     }
@@ -589,18 +644,20 @@ static void serve(int fd)
         return;
     }
     if (preview && media(req.type, "application/x-www-form-urlencoded")) {
-        const char *token = NULL;
-        if (form(req.body, &room, &token) || !room_valid(&room) || !*room.nick) {
+        const char *token = NULL, *intent = NULL;
+        if (form(req.body, &room, &token, &intent) || !room_valid(&room) || !*room.nick) {
             reply(fd, 400, "{\"saved\":false,\"error\":\"IP, puerto o apodo inválido.\"}", JSON, 0);
             return;
         }
         struct submission *entry = local ? find_submission(token) : NULL;
-        if (!entry) {
+        int64_t now = monotonic_ms();
+        if (!entry || strcmp(entry->intent, intent ? intent : "") ||
+            (*entry->intent && entry->result == 0 && (now < 0 || now >= entry->expires))) {
             reply(fd, 403, "{\"saved\":false,\"error\":\"Confirmación inválida o vencida. Volvé a abrir la sala.\"}", JSON, 0);
             return;
         }
         if (strcmp(entry->room.host, room.host) || entry->room.port != room.port ||
-            (entry->result != 0 && strcmp(entry->room.nick, room.nick))) {
+            ((*entry->intent || entry->result != 0) && strcmp(entry->room.nick, room.nick))) {
             reply(fd, 409, "{\"saved\":false,\"error\":\"La confirmación corresponde a otros datos. Volvé a abrir la sala.\"}", JSON, 0);
             return;
         }
