@@ -21,11 +21,12 @@
 #define PORT 24879
 #define ORIGIN "https://eden-rooms-ps5.pages.dev"
 #define ROOMS_ORIGIN "https://eden-rooms.pages.dev"
+#define PREVIEW_ORIGIN "https://test-enet-versions-sralcer.eden-rooms.pages.dev"
 #define CONFIG "/data/prosperoeden/config/prosperoeden.json"
 #define MAX_HEADER 8192
 #define MAX_BODY 2048
 #define REQUEST_TIMEOUT_MS 5000
-#define VERSION "v0.3.4-experimental"
+#define VERSION "v0.3.5-experimental"
 #define TRANSFER_TIMEOUT_MS 300000
 #ifdef EDEN_PS5
 #define PLATFORM "ps5"
@@ -41,6 +42,7 @@ static struct submission {
     int64_t expires;
     struct room room;
     int result;
+    const char *return_origin;
 } submissions[64];
 static size_t next_submission;
 static const char *config = CONFIG;
@@ -345,11 +347,13 @@ static int valid_intent(const char *intent)
     return intent && strlen(intent) == 32 && strspn(intent, "0123456789abcdef") == 32;
 }
 
-static const char *new_submission(const struct room *room, const char *intent)
+static const char *new_submission(const struct room *room, const char *intent,
+                                  const char *return_origin)
 {
     struct submission *entry = &submissions[next_submission];
     next_submission = (next_submission + 1) % (sizeof submissions / sizeof *submissions);
     entry->result = 0;
+    entry->return_origin = return_origin;
     strcpy(entry->intent, intent ? intent : "");
     entry->expires = intent ? monotonic_ms() + TRANSFER_TIMEOUT_MS : 0;
     entry->room = *room;
@@ -374,15 +378,28 @@ static struct submission *find_submission(const char *token)
     return NULL;
 }
 
-static void transfer_challenge(int fd, const char *intent, const char *token)
+static void transfer_challenge(int fd, const char *intent, const char *token,
+                               const char *return_origin)
 {
     char response[512];
     int size = snprintf(response, sizeof response,
         "HTTP/1.1 303 See Other\r\nConnection: close\r\nCache-Control: no-store\r\n"
         "Referrer-Policy: no-referrer\r\nContent-Length: 0\r\n"
-        "Location: " ROOMS_ORIGIN "/#eden-bridge-challenge=%s.%s\r\n\r\n", intent, token);
+        "Location: %s/#eden-bridge-challenge=%s.%s\r\n\r\n", return_origin, intent, token);
     if (size > 0 && (size_t)size < sizeof response)
         send_all(fd, response, (size_t)size);
+}
+
+static void saved_reply(int fd, const struct submission *entry)
+{
+    char body[160];
+    if (!entry->return_origin) {
+        reply(fd, 200, "{\"ok\":true,\"saved\":true}", JSON, 0);
+        return;
+    }
+    snprintf(body, sizeof body, "{\"ok\":true,\"saved\":true,\"returnOrigin\":\"%s\"}",
+             entry->return_origin);
+    reply(fd, 200, body, JSON, 0);
 }
 
 static int referred_by(const char *referer, const char *origin)
@@ -435,7 +452,7 @@ static const char save_script[] =
     "      if ([408, 502, 503, 504].includes(response.status) && attempt === 0) continue;\n"
     "      const result = await response.json();\n"
     "      if (!response.ok || result.saved !== true) throw new Error(result.error);\n"
-    "      return;\n"
+    "      return result;\n"
     "    } catch (error) {\n"
     "      if (attempt || !(error instanceof TypeError || error.name === 'AbortError' ||\n"
     "                       error instanceof SyntaxError)) throw error;\n"
@@ -453,11 +470,11 @@ static const char save_script[] =
     "    form.elements.nick.readOnly = true;\n"
     "    try { history.replaceState({confirm: data.get('confirm'), nick: data.get('nick'),\n"
     "      intent: data.get('intent')}, '', location.pathname + location.search); } catch {}\n"
-    "    await submit(data);\n"
+    "    const result = await submit(data);\n"
     "    form.hidden = true;\n"
     "    status.textContent = 'Sala guardada correctamente';\n"
     "    if (transfer) {\n"
-    "      location.replace(roomsOrigin + '/#eden-bridge-saved=' + data.get('intent') + '.' + data.get('confirm'));\n"
+    "      location.replace(result.returnOrigin + '/#eden-bridge-saved=' + data.get('intent') + '.' + data.get('confirm'));\n"
     "      return;\n"
     "    }\n"
     "    back.hidden = false;\n"
@@ -596,8 +613,10 @@ static void serve(int fd)
         reply(fd, 200, save_script, SCRIPT, 0);
         return;
     }
-    int receive = !strcmp(req.target, "/v1/receive");
-    int transfer = !strcmp(req.target, "/v1/transfer");
+    int preview_receive = !strcmp(req.target, "/v1/receive/preview");
+    int preview_transfer = !strcmp(req.target, "/v1/transfer/preview");
+    int receive = preview_receive || !strcmp(req.target, "/v1/receive");
+    int transfer = preview_transfer || !strcmp(req.target, "/v1/transfer");
     if (!strcmp(req.method, "GET") && (receive || transfer || !strcmp(req.target, "/v1/prepare"))) {
         const char *intent = NULL;
         if (!query || form(query, &room, NULL, transfer ? &intent : NULL) || !room_valid(&room) ||
@@ -607,7 +626,8 @@ static void serve(int fd)
             return;
         }
         if (transfer) {
-            transfer_challenge(fd, intent, new_submission(&room, intent));
+            const char *return_origin = preview_transfer ? PREVIEW_ORIGIN : ROOMS_ORIGIN;
+            transfer_challenge(fd, intent, new_submission(&room, intent, return_origin), return_origin);
             return;
         }
         int from_rooms = req.referer && !strcmp(req.referer, ROOMS_ORIGIN "/");
@@ -627,9 +647,10 @@ static void serve(int fd)
             "<p id='back' hidden><a href='%s/'>%s</a></p>"
             "<script src='/save.js' defer></script></html>",
             room.host, room.port, message, automatic, receive, room.host, room.port,
-            receive ? "" : new_submission(&room, NULL),
+            receive ? "" : new_submission(&room, NULL, NULL),
             receive ? "<input type='hidden' name='intent'>" : "", room.nick,
             receive ? "Reintentar" : "Confirmar sala",
+            preview_receive ? PREVIEW_ORIGIN :
             !receive && referred_by(req.referer, ORIGIN) ? ORIGIN : ROOMS_ORIGIN,
             receive ? "Iniciar un nuevo envío en Eden Rooms" : "Volver a Eden Rooms");
         reply(fd, 200, body, PAGE, 0);
@@ -675,7 +696,7 @@ static void serve(int fd)
             }
             entry->room = room;
             entry->result = saved;
-            reply(fd, 200, "{\"ok\":true,\"saved\":true}", JSON, 0);
+            saved_reply(fd, entry);
             snprintf(body, sizeof body, "Eden Bridge: %s - sala %s:%d guardada", room.nick, room.host, room.port);
             notify(body);
             return;
@@ -685,7 +706,7 @@ static void serve(int fd)
             return;
         }
         fprintf(stderr, "Eden Bridge %s: confirmación repetida\n", VERSION);
-        reply(fd, 200, "{\"ok\":true,\"saved\":true}", JSON, 0);
+        saved_reply(fd, entry);
         return;
     }
     if (!external && !local) {

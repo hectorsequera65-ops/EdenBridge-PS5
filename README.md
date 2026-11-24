@@ -2,7 +2,7 @@
 
 Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y los guarda en la configuración de ProsperoEden. La versión C experimental se compila con un SDK de payloads para PS5. El ELF de esta versión se compiló para PS5 y el guardado se verificó con configuraciones temporales en Linux.
 
-- [Versión experimental v0.3.4-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.4-experimental)
+- [Versión experimental v0.3.5-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.5-experimental)
 - [Versiones anteriores](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases)
 - [ELF original v0.1.0-original](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.1.0-original)
 
@@ -23,7 +23,7 @@ La confirmación exige una solicitud del mismo origen y un token aleatorio por f
 | `GET /v1/health` | Estado del servicio. |
 | `GET /v1/version` | Identifica la versión activa y la plataforma (`ps5` o `linux`). |
 | `GET /v1/config-check` | Comprueba si el archivo coincide con una estructura de escritura admitida. |
-| `GET /v1/transfer` | Valida la sala y devuelve un código aleatorio al sitio fijo de Eden Rooms. |
+| `GET /v1/transfer` | Valida la sala y devuelve un código aleatorio al sitio de producción de Eden Rooms. Las rutas `/v1/transfer/preview` y `/v1/receive/preview` habilitan el mismo flujo para la Preview `test/enet-versions-sralcer`. |
 | `GET /v1/receive` | Prepara el guardado en la misma pestaña con el código devuelto por Eden Rooms. |
 | `GET /v1/prepare` | Valida la sala y presenta el formulario de guardado. Admite un apodo inicial opcional. |
 | `POST /v1/preview` con JSON | Valida y devuelve `saved: false`. Acepta `host`, `port` y opcionalmente `nick` o `nickname`. |
