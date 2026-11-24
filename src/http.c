@@ -23,7 +23,13 @@
 #define MAX_HEADER 8192
 #define MAX_BODY 2048
 
-static char confirmation[33];
+/* The server handles one request at a time. Keep the most recent form results
+ * so a retry after a lost response cannot replay the write or notification. */
+static struct submission {
+    char token[33];
+    int result;
+} submissions[64];
+static size_t next_submission;
 static const char *config = CONFIG;
 
 static void notify(const char *message)
@@ -81,7 +87,9 @@ static void send_all(int fd, const char *data, size_t length)
     }
 }
 
-static void reply(int fd, int status, const char *body, int html, int cors)
+enum content { JSON, PAGE, SCRIPT };
+
+static void reply(int fd, int status, const char *body, enum content content, int cors)
 {
     const char *reason;
     switch (status) {
@@ -97,11 +105,12 @@ static void reply(int fd, int status, const char *body, int html, int cors)
     int size = snprintf(header, sizeof header,
         "HTTP/1.1 %d %s\r\nConnection: close\r\nCache-Control: no-store\r\n"
         "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n"
-        "Referrer-Policy: no-referrer\r\n"
+        "Referrer-Policy: same-origin\r\n"
         "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
-        "frame-ancestors 'none'; form-action 'self'; base-uri 'none'\r\n"
+        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'\r\n"
         "Content-Type: %s; charset=utf-8\r\nContent-Length: %zu\r\n%s\r\n",
-        status, reason, html ? "text/html" : "application/json", strlen(body),
+        status, reason, content == PAGE ? "text/html" :
+        content == SCRIPT ? "text/javascript" : "application/json", strlen(body),
         cors ? "Access-Control-Allow-Origin: " ORIGIN "\r\nVary: Origin\r\n"
                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
                "Access-Control-Allow-Headers: Content-Type\r\n"
@@ -113,7 +122,7 @@ static void reply(int fd, int status, const char *body, int html, int cors)
 }
 
 struct request {
-    char *method, *target, *host, *origin, *type, *body;
+    char *method, *target, *host, *origin, *type, *referer, *body;
 };
 
 static int header_value(char **slot, char *value)
@@ -201,6 +210,8 @@ static int read_request(int fd, char *buffer, struct request *req)
             slot = &req->host;
         else if (!strcasecmp(name, "Origin"))
             slot = &req->origin;
+        else if (!strcasecmp(name, "Referer"))
+            slot = &req->referer;
         else if (!strcasecmp(name, "Content-Length"))
             slot = &length;
         else if (!strcasecmp(name, "Content-Type"))
@@ -276,14 +287,37 @@ static int form(char *text, struct room *room, const char **token)
     return 0;
 }
 
-static int same_token(const char *token)
+static const char *new_submission(void)
 {
-    if (!token || strlen(token) != sizeof confirmation - 1)
-        return 0;
-    unsigned int diff = 0;
-    for (size_t i = 0; i < sizeof confirmation - 1; i++)
-        diff |= (unsigned char)token[i] ^ (unsigned char)confirmation[i];
-    return diff == 0;
+    struct submission *entry = &submissions[next_submission];
+    next_submission = (next_submission + 1) % (sizeof submissions / sizeof *submissions);
+    entry->result = 0;
+    unsigned char random[16];
+    arc4random_buf(random, sizeof random);
+    for (size_t i = 0; i < sizeof random; i++)
+        snprintf(entry->token + i * 2, 3, "%02x", (unsigned)random[i]);
+    return entry->token;
+}
+
+static struct submission *find_submission(const char *token)
+{
+    if (!token || strlen(token) != sizeof submissions[0].token - 1)
+        return NULL;
+    for (size_t i = 0; i < sizeof submissions / sizeof *submissions; i++) {
+        unsigned int diff = 0;
+        for (size_t j = 0; j < sizeof submissions[i].token - 1; j++)
+            diff |= (unsigned char)token[j] ^ (unsigned char)submissions[i].token[j];
+        if (!diff)
+            return &submissions[i];
+    }
+    return NULL;
+}
+
+static int referred_by(const char *referer, const char *origin)
+{
+    size_t length = strlen(origin);
+    return referer && !strncmp(referer, origin, length) &&
+           (referer[length] == '/' || referer[length] == 0);
 }
 
 #define HTML "<!doctype html><html lang='es'><meta charset='utf-8'>" \
@@ -292,6 +326,47 @@ static int same_token(const char *token)
              "body{font:17px system-ui;background:#101b2c;color:white;max-width:32rem;margin:10vh auto;padding:1rem}" \
              "label,input,button{display:block;margin:.7rem 0}input,button{font:inherit;padding:.6rem}" \
              "a{color:#9cf}</style><h1>Eden Bridge PS5</h1>"
+
+static const char save_script[] =
+    "const form = document.getElementById('room');\n"
+    "const status = document.getElementById('status');\n"
+    "const button = form.querySelector('button');\n"
+    "const back = document.getElementById('back');\n"
+    "const previous = history.state;\n"
+    "if (previous && previous.confirm) {\n"
+    "  form.elements.confirm.value = previous.confirm;\n"
+    "  form.elements.nick.value = previous.nick;\n"
+    "  form.elements.nick.readOnly = true;\n"
+    "}\n"
+    "let saving = false;\n"
+    "async function save() {\n"
+    "  if (saving || !form.reportValidity()) return;\n"
+    "  saving = true;\n"
+    "  button.disabled = true;\n"
+    "  back.hidden = true;\n"
+    "  status.textContent = 'Guardando sala…';\n"
+    "  const data = new URLSearchParams(new FormData(form));\n"
+    "  try {\n"
+    "    form.elements.nick.readOnly = true;\n"
+    "    history.replaceState({confirm: data.get('confirm'), nick: data.get('nick')}, '');\n"
+    "    const response = await fetch(form.action, {method: 'POST', body: data});\n"
+    "    const result = await response.json();\n"
+    "    if (!response.ok || result.saved !== true) throw new Error(result.error);\n"
+    "    form.hidden = true;\n"
+    "    status.textContent = 'Sala guardada correctamente';\n"
+    "    setTimeout(() => { back.hidden = false; window.close(); }, 1000);\n"
+    "  } catch (error) {\n"
+    "    status.textContent = error instanceof TypeError ?\n"
+    "      'No se recibió la confirmación del puente. Comprobá la conexión con la PS5.' :\n"
+    "      error.message || 'El puente devolvió una respuesta inesperada.';\n"
+    "    saving = false;\n"
+    "    button.disabled = false;\n"
+    "    button.textContent = 'Reintentar';\n"
+    "  }\n"
+    "}\n"
+    "form.addEventListener('submit', event => { event.preventDefault(); save(); });\n"
+    "button.disabled = false;\n"
+    "if (form.dataset.auto === '1' && form.checkValidity()) save();\n";
 
 static int media(const char *header, const char *type)
 {
@@ -306,7 +381,7 @@ static void serve(int fd)
     struct request req = {0};
     struct room room = {0};
     if (read_request(fd, buffer, &req)) {
-        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid request\"}", 0, 0);
+        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid request\"}", JSON, 0);
         return;
     }
 
@@ -329,7 +404,7 @@ static void serve(int fd)
     int local = req.origin && !strcmp(req.origin, self);
     if (!req.host || (!localhost && strcmp(req.host, authority)) ||
         (req.origin && !external && !local)) {
-        reply(fd, 403, "{\"ok\":false,\"error\":\"origin or host denied\"}", 0, 0);
+        reply(fd, 403, "{\"ok\":false,\"error\":\"origin or host denied\"}", JSON, 0);
         return;
     }
 
@@ -340,7 +415,7 @@ static void serve(int fd)
     int connection = !strcmp(req.target, "/v1/connection");
     int health = !strcmp(req.target, "/v1/health");
     if (!strcmp(req.method, "GET") && health && !query) {
-        reply(fd, 200, "{\"ok\":true,\"service\":\"eden-bridge\",\"writeEnabled\":false}", 0, external);
+        reply(fd, 200, "{\"ok\":true,\"service\":\"eden-bridge\",\"writeEnabled\":false}", JSON, external);
         return;
     }
     if (!strcmp(req.method, "GET") && !strcmp(req.target, "/v1/config-check") && !query) {
@@ -348,7 +423,7 @@ static void serve(int fd)
         snprintf(body, sizeof body, sections > 0 ?
             "{\"ok\":true,\"configReadable\":true,\"multiplayerFieldsFound\":true,\"nicknameFieldsFound\":true,\"multiplayerSections\":%d,\"writeEnabled\":true}" :
             "{\"ok\":false,\"error\":\"multiplayer fields not safely identified\",\"writeEnabled\":false}", sections);
-        reply(fd, sections > 0 ? 200 : 409, body, 0, external);
+        reply(fd, sections > 0 ? 200 : 409, body, JSON, external);
         return;
     }
     if (!strcmp(req.method, "GET") && !strcmp(req.target, "/") && !query) {
@@ -356,72 +431,93 @@ static void serve(int fd)
                          "<label>IP de la sala <input name='host' required></label>"
                          "<label>Puerto <input name='port' type='number' min='1' max='65535' required></label>"
                          "<label>Apodo <input name='nick' required maxlength='24' pattern='[A-Za-z0-9_\\-]{1,24}'></label>"
-                         "<button>Revisar sala</button></form></html>", 1, 0);
+                         "<button>Revisar sala</button></form></html>", PAGE, 0);
+        return;
+    }
+    if (!strcmp(req.method, "GET") && !strcmp(req.target, "/save.js") && !query) {
+        reply(fd, 200, save_script, SCRIPT, 0);
         return;
     }
     if (!strcmp(req.method, "GET") && !strcmp(req.target, "/v1/prepare")) {
         if (!query || form(query, &room, NULL) || !room_valid(&room)) {
-            reply(fd, 400, "{\"ok\":false,\"error\":\"invalid room\"}", 0, 0);
+            reply(fd, 400, HTML "<p>IP, puerto o apodo inválido.</p>"
+                  "<form action='/'><button>Reintentar</button></form></html>", PAGE, 0);
             return;
         }
+        int automatic = local || external || referred_by(req.referer, ORIGIN) ||
+                        referred_by(req.referer, self);
+        const char *message = !*room.nick ? "Ingresá tu apodo para continuar." :
+                              automatic ? "Preparando el guardado…" :
+                              "El navegador no identificó el origen del envío. Confirmá la sala.";
         snprintf(body, sizeof body, HTML "<p>Sala <strong>%s:%d</strong></p>"
-            "<p>Cerrá ProsperoEden antes de guardar la sala.</p>"
-            "<form method='post' action='/v1/preview'>"
+            "<p id='status' role='status'>%s</p>"
+            "<form id='room' data-auto='%d' method='post' action='/v1/preview'>"
             "<input type='hidden' name='host' value='%s'><input type='hidden' name='port' value='%d'>"
             "<input type='hidden' name='confirm' value='%s'>"
             "<label>Apodo <input name='nick' maxlength='24' pattern='[A-Za-z0-9_\\-]{1,24}' value='%s' required></label>"
-            "<button>Guardar sala en PS5</button></form></html>",
-            room.host, room.port, room.host, room.port, confirmation, room.nick);
-        reply(fd, 200, body, 1, 0);
+            "<button disabled>Confirmar sala</button></form>"
+            "<noscript><p>Activá JavaScript y volvé a abrir la sala.</p></noscript>"
+            "<p id='back' hidden>Podés cerrar esta pestaña o "
+            "<a href='" ORIGIN "/'>volver a Eden Rooms</a>.</p>"
+            "<script src='/save.js' defer></script></html>",
+            room.host, room.port, message, automatic, room.host, room.port, new_submission(), room.nick);
+        reply(fd, 200, body, PAGE, 0);
         return;
     }
     if (!strcmp(req.method, "OPTIONS") && !query && (preview || connection || health)) {
-        reply(fd, external ? 204 : 403, "", 0, external);
+        reply(fd, external ? 204 : 403, "", JSON, external);
         return;
     }
     if (strcmp(req.method, "POST") || query || (!preview && !connection)) {
-        reply(fd, 404, "{\"ok\":false,\"error\":\"unknown route\"}", 0, external);
+        reply(fd, 404, "{\"ok\":false,\"error\":\"unknown route\"}", JSON, external);
         return;
     }
     if (preview && media(req.type, "application/x-www-form-urlencoded")) {
         const char *token = NULL;
         if (form(req.body, &room, &token) || !room_valid(&room) || !*room.nick) {
-            reply(fd, 400, HTML "<p>IP, puerto o apodo inválido.</p></html>", 1, 0);
+            reply(fd, 400, "{\"saved\":false,\"error\":\"IP, puerto o apodo inválido.\"}", JSON, 0);
             return;
         }
-        if (!local || !same_token(token)) {
-            reply(fd, 403, HTML "<p>Confirmación inválida. Volvé a abrir la sala.</p></html>", 1, 0);
+        struct submission *entry = local ? find_submission(token) : NULL;
+        if (!entry) {
+            reply(fd, 403, "{\"saved\":false,\"error\":\"Confirmación inválida o vencida. Volvé a abrir la sala.\"}", JSON, 0);
             return;
         }
-        int saved = config_update(config, &room);
-        if (saved <= 0) {
-            reply(fd, saved == -2 ? 500 : 409, saved == -2 ?
-                HTML "<p>Se reemplazó la configuración, pero no se pudo confirmar su persistencia. Revisá el archivo y el respaldo.</p></html>" :
-                HTML "<p>No se guardó la sala. Revisá la estructura y los permisos de la configuración.</p></html>", 1, 0);
+        if (entry->result == 0) {
+            int saved = config_update(config, &room);
+            if (saved == -1) {
+                reply(fd, 409, "{\"saved\":false,\"error\":\"No se guardó la sala. Revisá la estructura y los permisos de la configuración.\"}", JSON, 0);
+                return;
+            }
+            entry->result = saved;
+            if (saved > 0) {
+                snprintf(body, sizeof body, "Eden Bridge: %s - sala %s:%d guardada", room.nick, room.host, room.port);
+                notify(body);
+            }
+        }
+        if (entry->result == -2) {
+            reply(fd, 500, "{\"saved\":false,\"error\":\"Se reemplazó la configuración, pero no se pudo confirmar su persistencia. Revisá el archivo y el respaldo.\"}", JSON, 0);
             return;
         }
-        snprintf(body, sizeof body, "Eden Bridge: %s - sala %s:%d guardada", room.nick, room.host, room.port);
-        notify(body);
-        reply(fd, 200, HTML "<h2>Sala guardada en PS5</h2><p>IP, puerto y apodo actualizados.</p>"
-                            "<p><a href='https://eden-rooms.pages.dev/'>Volver a Eden Rooms</a></p></html>", 1, 0);
+        reply(fd, 200, "{\"ok\":true,\"saved\":true}", JSON, 0);
         return;
     }
     if (!external && !local) {
-        reply(fd, 403, "{\"ok\":false,\"error\":\"origin denied\"}", 0, 0);
+        reply(fd, 403, "{\"ok\":false,\"error\":\"origin denied\"}", JSON, 0);
         return;
     }
     if ((!media(req.type, "application/json") && !media(req.type, "text/plain")) ||
         json_room(req.body, &room) || !room_valid(&room)) {
-        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid room\"}", 0, external);
+        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid room\"}", JSON, external);
         return;
     }
     if (connection && media(req.type, "text/plain")) {
-        reply(fd, 409, "{\"ok\":false,\"saved\":false,\"error\":\"confirmation required at /v1/prepare\"}", 0, external);
+        reply(fd, 409, "{\"ok\":false,\"saved\":false,\"error\":\"confirmation required at /v1/prepare\"}", JSON, external);
         return;
     }
     snprintf(body, sizeof body, "{\"ok\":true,\"received\":true,\"saved\":false,\"mode\":\"preview\","
         "\"host\":\"%s\",\"port\":%d,\"nick\":\"%s\",\"writeEnabled\":false}", room.host, room.port, room.nick);
-    reply(fd, 200, body, 0, external);
+    reply(fd, 200, body, JSON, external);
 }
 
 int main(int argc, char **argv)
@@ -439,10 +535,6 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
 #endif
-    unsigned char random[16];
-    arc4random_buf(random, sizeof random);
-    for (size_t i = 0; i < sizeof random; i++)
-        snprintf(confirmation + i * 2, 3, "%02x", (unsigned)random[i]);
     signal(SIGPIPE, SIG_IGN);
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;

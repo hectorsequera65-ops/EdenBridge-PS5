@@ -1,6 +1,6 @@
 # Eden Bridge PS5
 
-Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y permite guardarlos en la configuración de ProsperoEden. La versión C experimental se compiló con un SDK de payloads para PS5. El arranque, las notificaciones, el navegador y la escritura en la consola están pendientes de prueba.
+Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y los guarda en la configuración de ProsperoEden. La versión C experimental se compila con un SDK de payloads para PS5. El arranque, las notificaciones y la escritura en una consola física están pendientes de prueba.
 
 - [Versión experimental v0.2.0-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.2.0-experimental)
 - [ELF original v0.1.0-original](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.1.0-original)
@@ -8,20 +8,25 @@ Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y permi
 ## Flujo de Eden Rooms
 
 1. En una PS5 de pruebas con un cargador ELF compatible, iniciá el payload y anotá la IP mostrada en la notificación. El servicio escucha en IPv4 en el puerto TCP **24879**. Usalo en una red privada de confianza.
-2. En Eden Rooms, seleccioná una sala e ingresá la IP de la PS5 y tu apodo. El frontend abre `/v1/prepare?host=...&port=...&nick=...` en el puente. También podés abrir manualmente `http://IP-DE-LA-PS5:24879/`.
-3. Cerrá ProsperoEden. Revisá la sala y pulsá **Guardar sala en PS5**. Luego abrí ProsperoEden y comprobá los datos.
+2. Cerrá ProsperoEden antes de enviar. En Eden Rooms, seleccioná una sala e ingresá la IP de la PS5 y tu apodo. El frontend abre `/v1/prepare?host=...&port=...&nick=...` en el puente. También podés ingresar los datos desde `http://IP-DE-LA-PS5:24879/`.
+3. El puente valida los datos y guarda automáticamente si puede verificar el origen. Si el navegador omite la referencia al pasar de Eden Rooms (HTTPS) al puente (HTTP), aparece **Confirmar sala**. El formulario local también admite guardado automático.
+4. Una vez confirmada la escritura, aparece **Sala guardada correctamente**. El puente intenta cerrar la ventana un segundo después. Si el navegador bloquea el cierre, podés cerrar la pestaña o usar **volver a Eden Rooms**. Si falla el guardado, la página queda abierta con el motivo y **Reintentar**. Luego abrí ProsperoEden y comprobá los datos.
 
-La confirmación exige una solicitud del mismo origen y un token aleatorio de la instancia. El servidor comprueba `Host` contra la dirección local de la conexión. Los POST JSON de otro origen se limitan a `https://eden-rooms-ps5.pages.dev`. La validación de origen protege el flujo de navegador. Los equipos con acceso directo a la LAN pueden enviar solicitudes HTTP sin las restricciones del navegador.
+Eden Rooms puede navegar en la pestaña actual. Los navegadores suelen permitir el cierre por JavaScript de ventanas abiertas por contenido web y pueden impedirlo en una pestaña con historial de navegación. [Comportamiento de Window.close en MDN](https://developer.mozilla.org/en-US/docs/Web/API/Window/close)
+
+La política de referencia predeterminada del navegador omite el encabezado `Referer` de HTTPS a HTTP. Para automatizar el guardado en ese flujo, Eden Rooms tendría que enviar una referencia de origen verificable. [Políticas de Referer en MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Referrer-Policy)
+
+La confirmación exige una solicitud del mismo origen y un token aleatorio por formulario. El puente conserva los resultados de los 64 formularios más recientes para que un reintento del mismo formulario tras perder la respuesta no repita la escritura, el respaldo ni la notificación. El servidor comprueba `Host` contra la dirección local de la conexión. Los POST JSON de otro origen se limitan a `https://eden-rooms-ps5.pages.dev`. La validación de origen protege el flujo de navegador. Los equipos con acceso directo a la LAN pueden enviar solicitudes HTTP sin las restricciones del navegador.
 
 | Ruta | Comportamiento |
 | --- | --- |
 | `GET /v1/health` | Estado del servicio. |
 | `GET /v1/config-check` | Comprueba si el archivo coincide con una estructura de escritura admitida. |
-| `GET /v1/prepare` | Presenta IP y puerto para confirmar. Admite un apodo inicial opcional. |
+| `GET /v1/prepare` | Valida la sala y presenta el formulario de guardado. Admite un apodo inicial opcional. |
 | `POST /v1/preview` con JSON | Valida y devuelve `saved: false`. Acepta `host`, `port` y opcionalmente `nick` o `nickname`. |
 | `POST /v1/connection` con `application/json` | Mantiene la vista previa del prototipo Python. |
 | `POST /v1/connection` con `text/plain` | Devuelve `409` para indicar que se requiere confirmación. El frontend antiguo mostraría un guardado exitoso si recibiera `ok: true`. |
-| `POST /v1/preview` con formulario | Guarda tras validar la confirmación, IPv4, puerto de 1 a 65535 y apodo de 1 a 24 caracteres ASCII entre letras, números, guion y guion bajo. |
+| `POST /v1/preview` con formulario | Guarda tras validar la confirmación, IPv4, puerto de 1 a 65535 y apodo de 1 a 24 caracteres ASCII entre letras, números, guion y guion bajo. Devuelve `saved: true` tras confirmar la persistencia. |
 
 ## Archivos de ProsperoEden
 

@@ -28,12 +28,14 @@ def check(path, port):
     self_origin = f"http://127.0.0.1:{port}"
     backup = path.with_name(path.name + ".edenrooms.bak")
 
-    def request(method, route, status, *, origin=None, body=None, media=None, host=None):
+    def request(method, route, status, *, origin=None, body=None, media=None, host=None, referer=None):
         headers = {}
         if origin is not None:
             headers["Origin"] = origin
         if media:
             headers["Content-Type"] = media
+        if referer:
+            headers["Referer"] = referer
         if host:
             headers["Host"] = host
         with_connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
@@ -68,7 +70,12 @@ def check(path, port):
     request("POST", "/v1/connection", 200, origin=ORIGIN, media="application/json", body=payload)
     request("POST", "/v1/connection", 409, origin=ORIGIN, media="text/plain", body=payload)
     request("GET", "/v1/prepare?host=192.0.2.1&port=1&port=2", 400)
-    page = request("GET", "/v1/prepare?" + urlencode(room), 200)
+    prepare = "/v1/prepare?" + urlencode(room)
+    for referer in (None, ORIGIN + ".example/", "https://other.test/"):
+        assert "data-auto='0'" in request("GET", prepare, 200, referer=referer)
+    assert "data-auto='1'" in request("GET", prepare, 200, referer=self_origin + "/")
+    page = request("GET", prepare, 200, referer=ORIGIN + "/")
+    assert "data-auto='1'" in page
     token = re.search(r"name='confirm' value='([a-f0-9]{32})'", page)[1]
     media = "application/x-www-form-urlencoded"
     request("POST", "/v1/preview", 403, origin=self_origin, media=media, body=urlencode(room))
@@ -76,7 +83,8 @@ def check(path, port):
     request("POST", "/v1/preview", 403, origin=ORIGIN, media=media, body=submitted)
     assert path.read_text() == ORIGINAL and not backup.exists()
 
-    request("POST", "/v1/preview", 200, origin=self_origin, media=media, body=submitted)
+    assert json.loads(request("POST", "/v1/preview", 200, origin=self_origin,
+                              media=media, body=submitted))["saved"] is True
     expected = ORIGINAL.replace('"192.0.2.11"', '"192.0.2.100"').replace('"192.0.2.12"', '"192.0.2.100"')
     expected = expected.replace('"port":1,', '"port":24872,').replace('"port":2}', '"port":24872}')
     expected = expected.replace('"original"', '"Jugador_1"').replace('"activo"', '"Jugador_1"')
@@ -85,20 +93,28 @@ def check(path, port):
     assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(backup.stat().st_mode) == 0o640
 
     request("POST", "/v1/preview", 200, origin=self_origin, media=media, body=submitted)
-    assert backup.read_text() == expected
+    assert backup.read_text() == ORIGINAL
 
+    retry_page = request("GET", prepare, 200)
+    retry_token = re.search(r"name='confirm' value='([a-f0-9]{32})'", retry_page)[1]
+    assert retry_token != token
+    retry = urlencode(dict(room, confirm=retry_token))
     for malformed in ('{"multiplayer":}', '{"multiplayer":{"host":"a","port":1}}',
                       ORIGINAL.replace('"actual",', '"ausente",'),
                       ORIGINAL.replace('"port":1,', '"port":1, "port":2,', 1)):
         path.write_text(malformed)
         request("GET", "/v1/config-check", 409)
-        request("POST", "/v1/preview", 409, origin=self_origin, media=media, body=submitted)
-        assert path.read_text() == malformed and backup.read_text() == expected
+        request("POST", "/v1/preview", 409, origin=self_origin, media=media, body=retry)
+        assert path.read_text() == malformed and backup.read_text() == ORIGINAL
 
     path.unlink()
     path.symlink_to(backup)
-    request("POST", "/v1/preview", 409, origin=self_origin, media=media, body=submitted)
-    assert path.is_symlink() and backup.read_text() == expected
+    request("POST", "/v1/preview", 409, origin=self_origin, media=media, body=retry)
+    assert path.is_symlink() and backup.read_text() == ORIGINAL
+    path.unlink()
+    path.write_text(expected)
+    request("POST", "/v1/preview", 200, origin=self_origin, media=media, body=retry)
+    assert backup.read_text() == expected
     assert list(path.parent.glob("*.tmp.*")) == []
 
     raw_headers = [
