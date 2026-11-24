@@ -18,14 +18,14 @@ jobs:
             if command -v "llvm-config-$version" >/dev/null; then
               bindir=$(llvm-config-$version --bindir)
               if test -x "$bindir/clang" && test -x "$bindir/ld.lld" && test -x "$bindir/llvm-ar"; then
-                echo "LLVM_CONFIG=llvm-config-$version" >> "$GITHUB_ENV"
+                echo "LLVM_CONFIG=$(command -v "llvm-config-$version")" >> "$GITHUB_ENV"
                 exit 0
               fi
             fi
           done
           sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
           sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y clang-19 lld-19 llvm-19
-          echo LLVM_CONFIG=llvm-config-19 >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG=$(command -v llvm-config-19)" >> "$GITHUB_ENV"
       - name: Compilar SDK fijado
         run: |
           git init "$RUNNER_TEMP/sdk-src"
