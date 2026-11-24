@@ -346,10 +346,10 @@ static const char save_script[] =
     "  button.disabled = true;\n"
     "  back.hidden = true;\n"
     "  status.textContent = 'Guardando sala…';\n"
-    "  const data = new URLSearchParams(new FormData(form));\n"
     "  try {\n"
+    "    const data = new URLSearchParams(new FormData(form));\n"
     "    form.elements.nick.readOnly = true;\n"
-    "    history.replaceState({confirm: data.get('confirm'), nick: data.get('nick')}, '');\n"
+    "    try { history.replaceState({confirm: data.get('confirm'), nick: data.get('nick')}, ''); } catch {}\n"
     "    const response = await fetch(form.action, {method: 'POST', body: data});\n"
     "    const result = await response.json();\n"
     "    if (!response.ok || result.saved !== true) throw new Error(result.error);\n"
@@ -396,6 +396,22 @@ static int media(const char *header, const char *type)
            (header[size] == 0 || header[size] == ';');
 }
 
+static void config_failure(char *body, size_t size, const struct config_error *error,
+                           int result, int saving)
+{
+    const char *target = error->target ? error->target : "configuracion";
+    const char *message = !saving ? "No se pudo validar la configuración."
+                        : result == -2 ? "Se reemplazó la configuración. Revisá el archivo y el respaldo."
+                        : "No se guardó la sala.";
+    fprintf(stderr, "Eden Bridge: %s %s/%s (errno=%d%s%s)\n",
+            saving ? "guardado" : "validación", target, error->step, error->system_errno,
+            error->system_errno ? ": " : "", error->system_errno ? strerror(error->system_errno) : "");
+    snprintf(body, size, "{\"ok\":false,\"saved\":false,\"writeEnabled\":false,"
+             "\"step\":\"%s\",\"target\":\"%s\",\"errno\":%d,"
+             "\"error\":\"%s Etapa %s/%s (errno %d).\"}",
+             error->step, target, error->system_errno, message, target, error->step, error->system_errno);
+}
+
 static void serve(int fd)
 {
     char buffer[MAX_HEADER + MAX_BODY + 1], body[2048];
@@ -440,10 +456,13 @@ static void serve(int fd)
         return;
     }
     if (!strcmp(req.method, "GET") && !strcmp(req.target, "/v1/config-check") && !query) {
-        int sections = config_update(config, NULL);
-        snprintf(body, sizeof body, sections > 0 ?
-            "{\"ok\":true,\"configReadable\":true,\"multiplayerFieldsFound\":true,\"nicknameFieldsFound\":true,\"multiplayerSections\":%d,\"writeEnabled\":true}" :
-            "{\"ok\":false,\"error\":\"multiplayer fields not safely identified\",\"writeEnabled\":false}", sections);
+        struct config_error error;
+        int sections = config_update(config, NULL, &error);
+        if (sections > 0)
+            snprintf(body, sizeof body,
+            "{\"ok\":true,\"configReadable\":true,\"multiplayerFieldsFound\":true,\"nicknameFieldsFound\":true,\"multiplayerSections\":%d,\"writeEnabled\":true}", sections);
+        else
+            config_failure(body, sizeof body, &error, sections, 0);
         reply(fd, sections > 0 ? 200 : 409, body, JSON, external);
         return;
     }
@@ -507,9 +526,13 @@ static void serve(int fd)
             return;
         }
         if (entry->result == 0) {
-            int saved = config_update(config, &room);
-            if (saved == -1) {
-                reply(fd, 409, "{\"saved\":false,\"error\":\"No se guardó la sala. Revisá la estructura y los permisos de la configuración.\"}", JSON, 0);
+            struct config_error error;
+            int saved = config_update(config, &room, &error);
+            if (saved < 0) {
+                config_failure(body, sizeof body, &error, saved, 1);
+                if (saved == -2)
+                    entry->result = saved;
+                reply(fd, saved == -2 ? 500 : 409, body, JSON, 0);
                 return;
             }
             entry->result = saved;

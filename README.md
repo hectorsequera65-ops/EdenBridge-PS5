@@ -2,7 +2,7 @@
 
 Eden Bridge recibe la IP, el puerto y el apodo de una sala de Eden Rooms y los guarda en la configuración de ProsperoEden. La versión C experimental se compila con un SDK de payloads para PS5. El arranque, las notificaciones y la escritura en una consola física están pendientes de prueba.
 
-- [Versión experimental v0.3.1-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.1-experimental)
+- [Versión experimental v0.3.2-experimental](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.3.2-experimental)
 - [Versiones anteriores](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases)
 - [ELF original v0.1.0-original](https://github.com/hectorsequera65-ops/EdenBridge-PS5/releases/tag/v0.1.0-original)
 
@@ -31,7 +31,9 @@ La confirmación exige una solicitud del mismo origen y un token aleatorio por f
 
 ## Archivos de ProsperoEden
 
-El payload usa `/data/prosperoeden/config/prosperoeden.json`. Reconoce `multiplayer.host`, `multiplayer.port` y un único `nickname` en `multiplayer` o en el objeto que lo contiene. Si hay perfiles, exige un identificador de texto en `activeProfile` y un mapa `profiles` con ese perfil y los mismos campos. Este formato de perfiles es una hipótesis conservadora comprobada con archivos de prueba. La estructura de un archivo real de consola está pendiente de verificación.
+El payload usa `/data/prosperoeden/config/prosperoeden.json`. Reconoce `multiplayer.host`, `multiplayer.port` y un único `nickname` en `multiplayer` o en el objeto que lo contiene. En la estructura verificada con una copia de una PS5 con firmware 6.02, `profiles.current` selecciona el bloque activo dentro de `profile_settings`. Los campos `profiles.first` y `profiles.users` se conservan. También se admite el formato anterior con `activeProfile` y el mapa `profiles`. En ambos formatos se actualizan los tres campos del bloque general y del perfil activo.
+
+Si falla la validación o la escritura, la respuesta indica la etapa, el destino lógico y el código `errno` cuando corresponde. El registro del payload incluye el mensaje del sistema. Al consultar `/v1/config-check` se comprueban la lectura y la estructura del JSON sin realizar escrituras. Las pruebas de escritura de esta versión se ejecutaron sobre copias locales.
 
 El puente rechaza configuraciones ambiguas, archivos no regulares y enlaces simbólicos en la ruta del archivo. Cambia solo los valores de los campos reconocidos del bloque general y del perfil activo. Conserva el resto del JSON byte por byte. Guarda el contenido anterior en `prosperoeden.json.edenrooms.bak`, sincroniza el respaldo y reemplaza la configuración mediante un temporal del mismo directorio y un renombrado atómico. El respaldo corresponde al estado inmediatamente anterior al último guardado. La edición concurrente desde ProsperoEden queda fuera del flujo admitido.
 

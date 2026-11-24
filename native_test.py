@@ -121,6 +121,36 @@ def check(path, port):
     assert backup.read_text() == expected
     assert list(path.parent.glob("*.tmp.*")) == []
 
+    current = json.loads(ORIGINAL)
+    current["profile_settings"] = current.pop("profiles")
+    current["profiles"] = {"current": current.pop("activeProfile"), "first": "otro",
+                           "users": {"1": "actual", "2": "otro"}}
+    current["multiplayer"]["password"] = "preservar"
+    current["profile_settings"]["actual"]["multiplayer"]["password"] = "preservar-activo"
+    modern = json.dumps(current, indent=2) + "\n"
+    page = request("GET", prepare, 200)
+    token = re.search(r"name='confirm' value='([a-f0-9]{32})'", page)[1]
+    submitted = urlencode(dict(room, confirm=token))
+    for invalid, step in (
+        (modern.replace('"current": "actual"', '"current": "ausente"'), "perfil-activo-ausente-o-ambiguo"),
+        (modern.replace('"current": "actual"', '"current": "actual", "current": "otro"'), "selector-de-perfil"),
+        (modern.replace('"profiles": {', '"activeProfile": "otro", "profiles": {'), "selector-de-perfil"),
+    ):
+        path.write_text(invalid)
+        result = json.loads(request("POST", "/v1/preview", 409, origin=self_origin, media=media, body=submitted))
+        assert result["step"] == step
+        assert path.read_text() == invalid and backup.read_text() == expected
+
+    path.write_text(modern)
+    assert json.loads(request("GET", "/v1/config-check", 200))["multiplayerSections"] == 2
+    request("POST", "/v1/preview", 200, origin=self_origin, media=media, body=submitted)
+    for section in (current, current["profile_settings"]["actual"]):
+        section["multiplayer"].update(host=room["host"], port=room["port"])
+        nick_section = section if "nickname" in section else section["multiplayer"]
+        nick_section["nickname"] = room["nick"]
+    assert path.read_text() == json.dumps(current, indent=2) + "\n"
+    assert backup.read_text() == modern
+
     raw_headers = [
         b"Origin: " + ORIGIN.encode() + b"\r\nOrigin: " + ORIGIN.encode(),
         b"Content-Length: 0\r\nContent-Length: 0",

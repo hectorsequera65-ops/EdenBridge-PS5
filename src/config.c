@@ -234,37 +234,59 @@ static int write_all(int fd, const char *data, size_t length)
         ssize_t count = write(fd, data, length);
         if (count < 0 && errno == EINTR)
             continue;
-        if (count <= 0)
+        if (count <= 0) {
+            if (count == 0)
+                errno = EIO;
             return -1;
+        }
         data += count;
         length -= (size_t)count;
     }
     return 0;
 }
 
-static int stage(char *name, const char *data, size_t length, const struct stat *original)
+static const char *stage(char *name, const char *data, size_t length, const struct stat *original)
 {
     int fd = mkstemp(name);
     if (fd < 0)
-        return -1;
+        return "mkstemp";
     struct stat created;
-    int failed = fstat(fd, &created) ||
-                 ((created.st_uid != original->st_uid || created.st_gid != original->st_gid) &&
-                  (fchown(fd, original->st_uid, original->st_gid) || fstat(fd, &created) ||
-                   created.st_uid != original->st_uid || created.st_gid != original->st_gid)) ||
-                 write_all(fd, data, length) || fchmod(fd, original->st_mode & 0777) || fsync(fd);
-    if (close(fd) || failed) {
-        unlink(name);
-        return -1;
+    const char *operation = NULL;
+    if (fstat(fd, &created))
+        operation = "fstat";
+    else if (created.st_uid != original->st_uid || created.st_gid != original->st_gid) {
+        if (fchown(fd, original->st_uid, original->st_gid))
+            operation = "fchown";
+        else if (fstat(fd, &created))
+            operation = "fstat";
+        else if (created.st_uid != original->st_uid || created.st_gid != original->st_gid) {
+            errno = EPERM;
+            operation = "verificar-propietario";
+        }
     }
-    return 0;
+    if (!operation && write_all(fd, data, length))
+        operation = "write";
+    else if (!operation && fchmod(fd, original->st_mode & 0777))
+        operation = "fchmod";
+    else if (!operation && fsync(fd))
+        operation = "fsync";
+    int saved_errno = errno;
+    if (close(fd) && !operation) {
+        operation = "close";
+        saved_errno = errno;
+    }
+    if (operation)
+        unlink(name);
+    errno = saved_errno;
+    return operation;
 }
 
 /* A null room checks the supported schema without writing. */
-int config_update(const char *path, const struct room *room)
+int config_update(const char *path, const struct room *room, struct config_error *error)
 {
     struct stat original, current;
     char backup[1024], temp[1024], backup_temp[1024], directory[1024];
+    *error = (struct config_error){ .step = "ruta-demasiado-larga", .system_errno = 0 };
     if (strlen(path) > 980)
         return -1;
     snprintf(backup, sizeof backup, "%s.edenrooms.bak", path);
@@ -278,18 +300,28 @@ int config_update(const char *path, const struct room *room)
         slash[slash == directory ? 1 : 0] = 0;
 
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0)
+    if (fd < 0) {
+        *error = (struct config_error){ .step = "config.open", .system_errno = errno };
         return -1;
+    }
     int result = -1, dir = -1, temp_ready = 0, backup_ready = 0;
     char *input = NULL, *output = NULL;
     struct token *tokens = NULL;
-    if (fstat(fd, &original) || !S_ISREG(original.st_mode) ||
-        original.st_size <= 0 || original.st_size > MAX_CONFIG ||
-        flock(fd, (room ? LOCK_EX : LOCK_SH) | LOCK_NB))
+    if (fstat(fd, &original)) {
+        *error = (struct config_error){ .step = "config.fstat", .system_errno = errno };
         goto done;
+    }
+    *error = (struct config_error){ .step = "config.tipo-o-tamano", .system_errno = 0 };
+    if (!S_ISREG(original.st_mode) || original.st_size <= 0 || original.st_size > MAX_CONFIG)
+        goto done;
+    if (flock(fd, (room ? LOCK_EX : LOCK_SH) | LOCK_NB)) {
+        *error = (struct config_error){ .step = "config.flock", .system_errno = errno };
+        goto done;
+    }
     size_t size = (size_t)original.st_size;
     input = malloc(size + 1);
     tokens = malloc(MAX_TOKENS * sizeof *tokens);
+    *error = (struct config_error){ .step = "memoria", .system_errno = 0 };
     if (!input || !tokens)
         goto done;
     size_t used = 0;
@@ -297,10 +329,13 @@ int config_update(const char *path, const struct room *room)
         ssize_t count = read(fd, input + used, size - used);
         if (count < 0 && errno == EINTR)
             continue;
-        if (count <= 0)
+        if (count <= 0) {
+            *error = (struct config_error){ .step = "config.read", .system_errno = count < 0 ? errno : EIO };
             goto done;
+        }
         used += (size_t)count;
     }
+    *error = (struct config_error){ .step = "json-invalido", .system_errno = 0 };
     if (memchr(input, 0, size))
         goto done;
     input[size] = 0;
@@ -313,15 +348,34 @@ int config_update(const char *path, const struct room *room)
         snprintf(port, sizeof port, "%d", room->port);
         snprintf(nick, sizeof nick, "\"%s\"", room->nick);
     }
-    if (parse(&j) || replacements(&j, 0, edits, host, port, nick))
+    if (parse(&j))
         goto done;
+    *error = (struct config_error){ .step = "multiplayer-general", .system_errno = 0 };
+    if (replacements(&j, 0, edits, host, port, nick))
+        goto done;
+
     int count = 3;
     int profiles = member(&j, 0, "profiles");
     int active = member(&j, 0, "activeProfile");
-    if (profiles != -1 || active != -1) {
+    int settings = member(&j, 0, "profile_settings");
+    if (profiles != -1 || active != -1 || settings != -1) {
+        *error = (struct config_error){ .step = "selector-de-perfil", .system_errno = 0 };
         char name[128];
-        if (get_string(&j, active, name, sizeof name) || !name[0] ||
-            replacements(&j, member(&j, profiles, name), edits + 3, host, port, nick))
+        if (settings != -1) {
+            if (active != -1 || settings < 0)
+                goto done;
+            active = member(&j, profiles, "current");
+        } else {
+            settings = profiles;
+        }
+        if (get_string(&j, active, name, sizeof name) || !name[0])
+            goto done;
+        *error = (struct config_error){ .step = "perfil-activo-ausente-o-ambiguo", .system_errno = 0 };
+        int selected = member(&j, settings, name);
+        if (selected < 0)
+            goto done;
+        *error = (struct config_error){ .step = "multiplayer-perfil-activo", .system_errno = 0 };
+        if (replacements(&j, selected, edits + 3, host, port, nick))
             goto done;
         count = 6;
     }
@@ -331,6 +385,7 @@ int config_update(const char *path, const struct room *room)
     }
 
     qsort(edits, (size_t)count, sizeof *edits, compare);
+    *error = (struct config_error){ .step = "memoria", .system_errno = 0 };
     output = malloc(size + 256);
     if (!output)
         goto done;
@@ -346,25 +401,58 @@ int config_update(const char *path, const struct room *room)
     }
     memcpy(output + length, input + cursor, size - cursor);
     length += size - cursor;
+    *error = (struct config_error){ .step = "config.tamano-de-salida", .system_errno = 0 };
     if (length > MAX_CONFIG)
         goto done;
     dir = open(directory, O_RDONLY | O_DIRECTORY);
-    if (dir < 0 || stage(temp, output, length, &original))
+    if (dir < 0) {
+        *error = (struct config_error){ .step = "directorio.open", .system_errno = errno };
         goto done;
+    }
+    const char *operation = stage(temp, output, length, &original);
+    if (operation) {
+        *error = (struct config_error){ .step = operation, .system_errno = errno, .target = "temporal-config" };
+        goto done;
+    }
     temp_ready = 1;
-    if (stage(backup_temp, input, size, &original))
+    operation = stage(backup_temp, input, size, &original);
+    if (operation) {
+        *error = (struct config_error){ .step = operation, .system_errno = errno, .target = "temporal-respaldo" };
         goto done;
+    }
     backup_ready = 1;
-    if (lstat(path, &current) || current.st_dev != original.st_dev ||
-        current.st_ino != original.st_ino || current.st_size != original.st_size ||
+    if (lstat(path, &current)) {
+        *error = (struct config_error){ .step = "config.lstat", .system_errno = errno };
+        goto done;
+    }
+    *error = (struct config_error){ .step = "config.cambio-concurrente", .system_errno = 0 };
+    if (current.st_dev != original.st_dev || current.st_ino != original.st_ino ||
+        current.st_size != original.st_size ||
         current.st_mtim.tv_sec != original.st_mtim.tv_sec ||
         current.st_mtim.tv_nsec != original.st_mtim.tv_nsec ||
         current.st_ctim.tv_sec != original.st_ctim.tv_sec ||
-        current.st_ctim.tv_nsec != original.st_ctim.tv_nsec ||
-        rename(backup_temp, backup) || fsync(dir) || rename(temp, path))
+        current.st_ctim.tv_nsec != original.st_ctim.tv_nsec)
         goto done;
-    temp_ready = backup_ready = 0;
-    result = fsync(dir) ? -2 : count / 3;
+    if (rename(backup_temp, backup)) {
+        *error = (struct config_error){ .step = "respaldo.rename", .system_errno = errno };
+        goto done;
+    }
+    backup_ready = 0;
+    if (fsync(dir)) {
+        *error = (struct config_error){ .step = "respaldo.fsync-directorio", .system_errno = errno };
+        goto done;
+    }
+    if (rename(temp, path)) {
+        *error = (struct config_error){ .step = "config.rename", .system_errno = errno };
+        goto done;
+    }
+    temp_ready = 0;
+    if (fsync(dir)) {
+        *error = (struct config_error){ .step = "config.fsync-directorio", .system_errno = errno };
+        result = -2;
+        goto done;
+    }
+    result = count / 3;
 
 done:
     if (backup_ready)
