@@ -1,13 +1,38 @@
-name: Verificar reconstrucción
-on: [push, pull_request]
+name: Verificar Eden Bridge
+on: [push, pull_request, workflow_dispatch]
 
 permissions:
   contents: read
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      SDK_REF: 52bed4e91afd678f5d03c881a91be0a75de18a06
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m py_compile bridge.py smoke_test.py
-      - run: python3 smoke_test.py
+      - run: make test
+      - name: Instalar herramientas del SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-19 lld-19 llvm-19
+      - name: Compilar SDK fijado
+        run: |
+          git init "$RUNNER_TEMP/sdk-src"
+          git -C "$RUNNER_TEMP/sdk-src" fetch --depth=1 https://github.com/hectorsequera65-ops/sdk.git "$SDK_REF"
+          git -C "$RUNNER_TEMP/sdk-src" checkout --detach FETCH_HEAD
+          make -C "$RUNNER_TEMP/sdk-src" -j2 LLVM_CONFIG=llvm-config-19 DESTDIR="$RUNNER_TEMP/sdk" install
+      - name: Compilar y comprobar ELF
+        run: |
+          make ps5 PS5_PAYLOAD_SDK="$RUNNER_TEMP/sdk"
+          file build/EdenBridge-PS5.elf
+          readelf -hW build/EdenBridge-PS5.elf
+          readelf -dW build/EdenBridge-PS5.elf | grep -F libkernel_web.sprx
+          (cd build && sha256sum EdenBridge-PS5.elf > EdenBridge-PS5.elf.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EdenBridge-PS5-experimental
+          path: |
+            build/EdenBridge-PS5.elf
+            build/EdenBridge-PS5.elf.sha256
+          if-no-files-found: error

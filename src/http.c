@@ -1,0 +1,481 @@
+#include "bridge.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#ifdef EDEN_PS5
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#define PORT 24879
+#define ORIGIN "https://eden-rooms-ps5.pages.dev"
+#define CONFIG "/data/prosperoeden/config/prosperoeden.json"
+#define MAX_HEADER 8192
+#define MAX_BODY 2048
+
+static char confirmation[33];
+static const char *config = CONFIG;
+
+static void notify(const char *message)
+{
+    fprintf(stderr, "%s\n", message);
+#ifdef EDEN_PS5
+    /* The SDK sample and original ELF use a 0xc30-byte request. */
+    struct {
+        char prefix[45];
+        char message[3075];
+    } request = {0};
+    extern int sceKernelSendNotificationRequest(int, const void *, size_t, int);
+    snprintf(request.message, sizeof request.message, "%s", message);
+    sceKernelSendNotificationRequest(0, &request, sizeof request, 0);
+#endif
+}
+
+static void notify_started(int port)
+{
+    char message[128];
+#ifdef EDEN_PS5
+    struct ifaddrs *interfaces;
+    char ip[INET_ADDRSTRLEN] = "";
+    if (!getifaddrs(&interfaces)) {
+        for (struct ifaddrs *it = interfaces; it; it = it->ifa_next) {
+            if (it->ifa_addr && it->ifa_addr->sa_family == AF_INET &&
+                (it->ifa_flags & IFF_UP) && !(it->ifa_flags & IFF_LOOPBACK)) {
+                const struct sockaddr_in *address = (const struct sockaddr_in *)it->ifa_addr;
+                if (address->sin_addr.s_addr && inet_ntop(AF_INET, &address->sin_addr, ip, sizeof ip))
+                    break;
+            }
+        }
+        freeifaddrs(interfaces);
+    }
+    if (*ip) {
+        snprintf(message, sizeof message, "Eden Bridge PS5: http://%s:%d", ip, port);
+        notify(message);
+        return;
+    }
+#endif
+    snprintf(message, sizeof message, "Eden Bridge iniciado: puerto %d", port);
+    notify(message);
+}
+
+static void send_all(int fd, const char *data, size_t length)
+{
+    while (length) {
+        ssize_t n = send(fd, data, length, 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return;
+        data += n;
+        length -= (size_t)n;
+    }
+}
+
+static void reply(int fd, int status, const char *body, int html, int cors)
+{
+    const char *reason;
+    switch (status) {
+    case 200: reason = "OK"; break;
+    case 204: reason = "No Content"; break;
+    case 403: reason = "Forbidden"; break;
+    case 404: reason = "Not Found"; break;
+    case 409: reason = "Conflict"; break;
+    case 500: reason = "Internal Server Error"; break;
+    default: reason = "Bad Request"; break;
+    }
+    char header[1024];
+    int size = snprintf(header, sizeof header,
+        "HTTP/1.1 %d %s\r\nConnection: close\r\nCache-Control: no-store\r\n"
+        "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n"
+        "Referrer-Policy: no-referrer\r\n"
+        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; "
+        "frame-ancestors 'none'; form-action 'self'; base-uri 'none'\r\n"
+        "Content-Type: %s; charset=utf-8\r\nContent-Length: %zu\r\n%s\r\n",
+        status, reason, html ? "text/html" : "application/json", strlen(body),
+        cors ? "Access-Control-Allow-Origin: " ORIGIN "\r\nVary: Origin\r\n"
+               "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+               "Access-Control-Allow-Headers: Content-Type\r\n"
+               "Access-Control-Allow-Private-Network: true\r\n" : "");
+    if (size > 0 && (size_t)size < sizeof header) {
+        send_all(fd, header, (size_t)size);
+        send_all(fd, body, strlen(body));
+    }
+}
+
+struct request {
+    char *method, *target, *host, *origin, *type, *body;
+};
+
+static int header_value(char **slot, char *value)
+{
+    if (*slot || !*value)
+        return -1;
+    *slot = value;
+    return 0;
+}
+
+static int decimal(const char *text, size_t max, int *result)
+{
+    size_t length = strlen(text);
+    if (!length || length > max || strspn(text, "0123456789") != length)
+        return -1;
+    *result = atoi(text);
+    return 0;
+}
+
+static ssize_t receive(int fd, char *buffer, size_t size, time_t deadline)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) || now.tv_sec >= deadline)
+        return -1;
+    ssize_t count = recv(fd, buffer, size, 0);
+    if (count <= 0 || memchr(buffer, 0, (size_t)count))
+        return -1;
+    return count;
+}
+
+static int read_request(int fd, char *buffer, struct request *req)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now))
+        return -1;
+    time_t deadline = now.tv_sec + 5;
+    size_t used = 0;
+    char *end = NULL;
+    while (!end && used < MAX_HEADER) {
+        ssize_t n = receive(fd, buffer + used, MAX_HEADER - used, deadline);
+        if (n < 0)
+            return -1;
+        used += (size_t)n;
+        buffer[used] = 0;
+        end = strstr(buffer, "\r\n\r\n");
+    }
+    if (!end)
+        return -1;
+    req->body = end + 4;
+    char *line = strstr(buffer, "\r\n");
+    *line = 0;
+    req->method = buffer;
+    char *target = strchr(buffer, ' ');
+    if (!target)
+        return -1;
+    *target++ = 0;
+    req->target = target;
+    char *version = strchr(target, ' ');
+    if (!version || *target != '/')
+        return -1;
+    *version++ = 0;
+    if (strcmp(version, "HTTP/1.1") && strcmp(version, "HTTP/1.0"))
+        return -1;
+    char *length = NULL;
+    while (line < end) {
+        char *name = line + 2;
+        line = strstr(name, "\r\n");
+        *line = 0;
+        char *colon = strchr(name, ':');
+        if (!colon || colon == name)
+            return -1;
+        *colon = 0;
+        if (strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~") != strlen(name))
+            return -1;
+        char *value = colon + 1;
+        value += strspn(value, " \t");
+        char *tail = line;
+        while (tail > value && (tail[-1] == ' ' || tail[-1] == '\t'))
+            *--tail = 0;
+        for (const unsigned char *c = (const unsigned char *)value; *c; c++)
+            if ((*c < 32 && *c != '\t') || *c == 127)
+                return -1;
+        char **slot = NULL;
+        if (!strcasecmp(name, "Host"))
+            slot = &req->host;
+        else if (!strcasecmp(name, "Origin"))
+            slot = &req->origin;
+        else if (!strcasecmp(name, "Content-Length"))
+            slot = &length;
+        else if (!strcasecmp(name, "Content-Type"))
+            slot = &req->type;
+        else if (!strcasecmp(name, "Transfer-Encoding"))
+            return -1;
+        if (slot && header_value(slot, value))
+            return -1;
+    }
+    int body_size = 0;
+    if (length && (decimal(length, 4, &body_size) || body_size > MAX_BODY))
+        return -1;
+    size_t offset = (size_t)(req->body - buffer);
+    size_t total = offset + (size_t)body_size;
+    if (used > total)
+        return -1;
+    while (used < total) {
+        ssize_t n = receive(fd, buffer + used, total - used, deadline);
+        if (n < 0)
+            return -1;
+        used += (size_t)n;
+    }
+    buffer[total] = 0;
+    return 0;
+}
+
+static int room_valid(const struct room *room)
+{
+    struct in_addr ip;
+    return inet_pton(AF_INET, room->host, &ip) == 1 &&
+           room->port > 0 && room->port <= 65535 &&
+           strspn(room->nick, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+               == strlen(room->nick);
+}
+
+/* All accepted field values use URL-unreserved characters. */
+static int form(char *text, struct room *room, const char **token)
+{
+    char *host = NULL, *port = NULL, *nick = NULL, *key = NULL;
+    while (*text) {
+        char *next = strchr(text, '&');
+        if (next)
+            *next++ = 0;
+        char *value = strchr(text, '=');
+        if (!value)
+            return -1;
+        *value++ = 0;
+        char **slot = NULL;
+        if (!strcmp(text, "host"))
+            slot = &host;
+        else if (!strcmp(text, "port"))
+            slot = &port;
+        else if (!strcmp(text, "nick"))
+            slot = &nick;
+        else if (!strcmp(text, "confirm") && token)
+            slot = &key;
+        if (!slot || header_value(slot, value))
+            return -1;
+        if (!next)
+            break;
+        if (!*next)
+            return -1;
+        text = next;
+    }
+    if (!host || !port || strlen(host) >= sizeof room->host ||
+        decimal(port, 5, &room->port) || (nick && strlen(nick) >= sizeof room->nick))
+        return -1;
+    strcpy(room->host, host);
+    if (nick)
+        strcpy(room->nick, nick);
+    if (token)
+        *token = key;
+    return 0;
+}
+
+static int same_token(const char *token)
+{
+    if (!token || strlen(token) != sizeof confirmation - 1)
+        return 0;
+    unsigned int diff = 0;
+    for (size_t i = 0; i < sizeof confirmation - 1; i++)
+        diff |= (unsigned char)token[i] ^ (unsigned char)confirmation[i];
+    return diff == 0;
+}
+
+#define HTML "<!doctype html><html lang='es'><meta charset='utf-8'>" \
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>" \
+             "<title>Eden Bridge PS5</title><style>" \
+             "body{font:17px system-ui;background:#101b2c;color:white;max-width:32rem;margin:10vh auto;padding:1rem}" \
+             "label,input,button{display:block;margin:.7rem 0}input,button{font:inherit;padding:.6rem}" \
+             "a{color:#9cf}</style><h1>Eden Bridge PS5</h1>"
+
+static int media(const char *header, const char *type)
+{
+    size_t size = strlen(type);
+    return header && !strncasecmp(header, type, size) &&
+           (header[size] == 0 || header[size] == ';');
+}
+
+static void serve(int fd)
+{
+    char buffer[MAX_HEADER + MAX_BODY + 1], body[2048];
+    struct request req = {0};
+    struct room room = {0};
+    if (read_request(fd, buffer, &req)) {
+        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid request\"}", 0, 0);
+        return;
+    }
+
+    struct sockaddr_in address = {0};
+    socklen_t length = sizeof address;
+    char ip[INET_ADDRSTRLEN], authority[64], self[80];
+    if (getsockname(fd, (struct sockaddr *)&address, &length) ||
+        !inet_ntop(AF_INET, &address.sin_addr, ip, sizeof ip))
+        return;
+    snprintf(authority, sizeof authority, "%s:%u", ip, (unsigned)ntohs(address.sin_port));
+    snprintf(self, sizeof self, "http://%s", authority);
+    int loopback = (ntohl(address.sin_addr.s_addr) >> 24) == 127;
+    char local_authority[64];
+    snprintf(local_authority, sizeof local_authority, "localhost:%u", (unsigned)ntohs(address.sin_port));
+    int localhost = loopback && req.host && !strcmp(req.host, local_authority);
+    if (localhost)
+        snprintf(self, sizeof self, "http://%s", local_authority);
+
+    int external = req.origin && !strcmp(req.origin, ORIGIN);
+    int local = req.origin && !strcmp(req.origin, self);
+    if (!req.host || (!localhost && strcmp(req.host, authority)) ||
+        (req.origin && !external && !local)) {
+        reply(fd, 403, "{\"ok\":false,\"error\":\"origin or host denied\"}", 0, 0);
+        return;
+    }
+
+    char *query = strchr(req.target, '?');
+    if (query)
+        *query++ = 0;
+    int preview = !strcmp(req.target, "/v1/preview");
+    int connection = !strcmp(req.target, "/v1/connection");
+    int health = !strcmp(req.target, "/v1/health");
+    if (!strcmp(req.method, "GET") && health && !query) {
+        reply(fd, 200, "{\"ok\":true,\"service\":\"eden-bridge\",\"writeEnabled\":false}", 0, external);
+        return;
+    }
+    if (!strcmp(req.method, "GET") && !strcmp(req.target, "/v1/config-check") && !query) {
+        int sections = config_update(config, NULL);
+        snprintf(body, sizeof body, sections > 0 ?
+            "{\"ok\":true,\"configReadable\":true,\"multiplayerFieldsFound\":true,\"nicknameFieldsFound\":true,\"multiplayerSections\":%d,\"writeEnabled\":true}" :
+            "{\"ok\":false,\"error\":\"multiplayer fields not safely identified\",\"writeEnabled\":false}", sections);
+        reply(fd, sections > 0 ? 200 : 409, body, 0, external);
+        return;
+    }
+    if (!strcmp(req.method, "GET") && !strcmp(req.target, "/") && !query) {
+        reply(fd, 200, HTML "<form action='/v1/prepare' method='get'>"
+                         "<label>IP de la sala <input name='host' required></label>"
+                         "<label>Puerto <input name='port' type='number' min='1' max='65535' required></label>"
+                         "<label>Apodo <input name='nick' required maxlength='24' pattern='[A-Za-z0-9_\\-]{1,24}'></label>"
+                         "<button>Revisar sala</button></form></html>", 1, 0);
+        return;
+    }
+    if (!strcmp(req.method, "GET") && !strcmp(req.target, "/v1/prepare")) {
+        if (!query || form(query, &room, NULL) || !room_valid(&room)) {
+            reply(fd, 400, "{\"ok\":false,\"error\":\"invalid room\"}", 0, 0);
+            return;
+        }
+        snprintf(body, sizeof body, HTML "<p>Sala <strong>%s:%d</strong></p>"
+            "<p>Cerrá ProsperoEden antes de guardar la sala.</p>"
+            "<form method='post' action='/v1/preview'>"
+            "<input type='hidden' name='host' value='%s'><input type='hidden' name='port' value='%d'>"
+            "<input type='hidden' name='confirm' value='%s'>"
+            "<label>Apodo <input name='nick' maxlength='24' pattern='[A-Za-z0-9_\\-]{1,24}' value='%s' required></label>"
+            "<button>Guardar sala en PS5</button></form></html>",
+            room.host, room.port, room.host, room.port, confirmation, room.nick);
+        reply(fd, 200, body, 1, 0);
+        return;
+    }
+    if (!strcmp(req.method, "OPTIONS") && !query && (preview || connection || health)) {
+        reply(fd, external ? 204 : 403, "", 0, external);
+        return;
+    }
+    if (strcmp(req.method, "POST") || query || (!preview && !connection)) {
+        reply(fd, 404, "{\"ok\":false,\"error\":\"unknown route\"}", 0, external);
+        return;
+    }
+    if (preview && media(req.type, "application/x-www-form-urlencoded")) {
+        const char *token = NULL;
+        if (form(req.body, &room, &token) || !room_valid(&room) || !*room.nick) {
+            reply(fd, 400, HTML "<p>IP, puerto o apodo inválido.</p></html>", 1, 0);
+            return;
+        }
+        if (!local || !same_token(token)) {
+            reply(fd, 403, HTML "<p>Confirmación inválida. Volvé a abrir la sala.</p></html>", 1, 0);
+            return;
+        }
+        int saved = config_update(config, &room);
+        if (saved <= 0) {
+            reply(fd, saved == -2 ? 500 : 409, saved == -2 ?
+                HTML "<p>Se reemplazó la configuración, pero no se pudo confirmar su persistencia. Revisá el archivo y el respaldo.</p></html>" :
+                HTML "<p>No se guardó la sala. Revisá la estructura y los permisos de la configuración.</p></html>", 1, 0);
+            return;
+        }
+        snprintf(body, sizeof body, "Eden Bridge: %s - sala %s:%d guardada", room.nick, room.host, room.port);
+        notify(body);
+        reply(fd, 200, HTML "<h2>Sala guardada en PS5</h2><p>IP, puerto y apodo actualizados.</p>"
+                            "<p><a href='https://eden-rooms.pages.dev/'>Volver a Eden Rooms</a></p></html>", 1, 0);
+        return;
+    }
+    if (!external && !local) {
+        reply(fd, 403, "{\"ok\":false,\"error\":\"origin denied\"}", 0, 0);
+        return;
+    }
+    if ((!media(req.type, "application/json") && !media(req.type, "text/plain")) ||
+        json_room(req.body, &room) || !room_valid(&room)) {
+        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid room\"}", 0, external);
+        return;
+    }
+    if (connection && media(req.type, "text/plain")) {
+        reply(fd, 409, "{\"ok\":false,\"saved\":false,\"error\":\"confirmation required at /v1/prepare\"}", 0, external);
+        return;
+    }
+    snprintf(body, sizeof body, "{\"ok\":true,\"received\":true,\"saved\":false,\"mode\":\"preview\","
+        "\"host\":\"%s\",\"port\":%d,\"nick\":\"%s\",\"writeEnabled\":false}", room.host, room.port, room.nick);
+    reply(fd, 200, body, 0, external);
+}
+
+int main(int argc, char **argv)
+{
+    int port = PORT;
+    uint32_t bind_address = INADDR_ANY;
+#ifndef EDEN_PS5
+    bind_address = INADDR_LOOPBACK;
+    if (argc != 3 || decimal(argv[2], 5, &port) || port < 1 || port > 65535) {
+        fprintf(stderr, "Uso: %s ARCHIVO_JSON PUERTO\n", argv[0]);
+        return 2;
+    }
+    config = argv[1];
+#else
+    (void)argc;
+    (void)argv;
+#endif
+    unsigned char random[16];
+    arc4random_buf(random, sizeof random);
+    for (size_t i = 0; i < sizeof random; i++)
+        snprintf(confirmation + i * 2, 3, "%02x", (unsigned)random[i]);
+    signal(SIGPIPE, SIG_IGN);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    int yes = 1;
+    struct sockaddr_in address = {0};
+#ifdef EDEN_PS5
+    address.sin_len = sizeof address;
+#endif
+    address.sin_family = AF_INET;
+    address.sin_port = htons((uint16_t)port);
+    address.sin_addr.s_addr = htonl(bind_address);
+    if (listener < 0 || setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) ||
+        bind(listener, (struct sockaddr *)&address, sizeof address) || listen(listener, 8)) {
+        perror("Eden Bridge");
+        notify("Eden Bridge: no se pudo iniciar el servidor HTTP");
+        if (listener >= 0)
+            close(listener);
+        return 1;
+    }
+    notify_started(port);
+    for (;;) {
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0 && errno == EINTR)
+            continue;
+        if (fd < 0) {
+            perror("accept");
+            break;
+        }
+        struct timeval timeout = { .tv_sec = 2 };
+        if (!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) &&
+            !setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout))
+            serve(fd);
+        close(fd);
+    }
+    close(listener);
+    return 1;
+}
