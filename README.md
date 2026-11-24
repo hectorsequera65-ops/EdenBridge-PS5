@@ -31,7 +31,7 @@ El puente rechaza configuraciones ambiguas, archivos no regulares y enlaces simb
 
 ## Compilación y pruebas
 
-El SDK utilizado es el [fork hectorsequera65-ops/sdk en la revisión 52bed4e](https://github.com/hectorsequera65-ops/sdk/tree/52bed4e91afd678f5d03c881a91be0a75de18a06). GitHub Actions usa LLVM 19, construye esa revisión y publica el ELF y su SHA-256 como artefactos del job.
+El SDK utilizado es el [fork hectorsequera65-ops/sdk en la revisión 52bed4e](https://github.com/hectorsequera65-ops/sdk/tree/52bed4e91afd678f5d03c881a91be0a75de18a06). GitHub Actions usa LLVM 19 o 18, construye esa revisión y publica el ELF y su SHA-256 como artefactos del job.
 
 ```bash
 git clone https://github.com/hectorsequera65-ops/sdk.git

@@ -12,16 +12,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make test
-      - name: Instalar herramientas del SDK
+      - name: Seleccionar herramientas del SDK
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-19 lld-19 llvm-19
+          for version in 19 18; do
+            if command -v "llvm-config-$version" >/dev/null; then
+              bindir=$(llvm-config-$version --bindir)
+              if test -x "$bindir/clang" && test -x "$bindir/ld.lld" && test -x "$bindir/llvm-ar"; then
+                echo "LLVM_CONFIG=llvm-config-$version" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+          done
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y clang-19 lld-19 llvm-19
+          echo LLVM_CONFIG=llvm-config-19 >> "$GITHUB_ENV"
       - name: Compilar SDK fijado
         run: |
           git init "$RUNNER_TEMP/sdk-src"
           git -C "$RUNNER_TEMP/sdk-src" fetch --depth=1 https://github.com/hectorsequera65-ops/sdk.git "$SDK_REF"
           git -C "$RUNNER_TEMP/sdk-src" checkout --detach FETCH_HEAD
-          make -C "$RUNNER_TEMP/sdk-src" -j2 LLVM_CONFIG=llvm-config-19 DESTDIR="$RUNNER_TEMP/sdk" install
+          make -C "$RUNNER_TEMP/sdk-src" -j2 LLVM_CONFIG="$LLVM_CONFIG" DESTDIR="$RUNNER_TEMP/sdk" install
       - name: Compilar y comprobar ELF
         run: |
           make ps5 PS5_PAYLOAD_SDK="$RUNNER_TEMP/sdk"
