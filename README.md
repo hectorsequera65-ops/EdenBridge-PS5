@@ -35,7 +35,7 @@ El payload usa `/data/prosperoeden/config/prosperoeden.json`. Reconoce `multipla
 
 Si falla la validación o la escritura, la respuesta indica la etapa, el destino lógico y el código `errno` cuando corresponde. El registro del payload incluye el mensaje del sistema. Al consultar `/v1/config-check` se comprueban la lectura y la estructura del JSON sin realizar escrituras. Las pruebas de escritura de esta versión se ejecutaron sobre copias locales.
 
-El puente rechaza configuraciones ambiguas, archivos no regulares y enlaces simbólicos en la ruta del archivo. Cambia solo los valores de los campos reconocidos del bloque general y del perfil activo. Conserva el resto del JSON byte por byte. Guarda el contenido anterior en `prosperoeden.json.edenrooms.bak`, sincroniza el respaldo y reemplaza la configuración mediante un temporal del mismo directorio y un renombrado atómico. El respaldo corresponde al estado inmediatamente anterior al último guardado. La edición concurrente desde ProsperoEden queda fuera del flujo admitido.
+El puente rechaza configuraciones ambiguas, archivos no regulares y enlaces simbólicos en la ruta del archivo. Cambia solo los valores de los campos reconocidos del bloque general y del perfil activo. Conserva el resto del JSON byte por byte. Guarda el contenido anterior en `prosperoeden.json.edenrooms.bak` con permisos `0600`, sincroniza el respaldo y reemplaza la configuración mediante un temporal del mismo directorio y un renombrado atómico. El respaldo corresponde al estado inmediatamente anterior al último guardado. La edición concurrente desde ProsperoEden queda fuera del flujo admitido.
 
 ## Compilación y pruebas
 

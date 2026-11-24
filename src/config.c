@@ -245,7 +245,8 @@ static int write_all(int fd, const char *data, size_t length)
     return 0;
 }
 
-static const char *stage(char *name, const char *data, size_t length, const struct stat *original)
+static const char *stage(char *name, const char *data, size_t length,
+                         const struct stat *original, mode_t mode)
 {
     int fd = mkstemp(name);
     if (fd < 0)
@@ -266,7 +267,7 @@ static const char *stage(char *name, const char *data, size_t length, const stru
     }
     if (!operation && write_all(fd, data, length))
         operation = "write";
-    else if (!operation && fchmod(fd, original->st_mode & 0777))
+    else if (!operation && fchmod(fd, mode))
         operation = "fchmod";
     else if (!operation && fsync(fd))
         operation = "fsync";
@@ -409,13 +410,13 @@ int config_update(const char *path, const struct room *room, struct config_error
         *error = (struct config_error){ .step = "directorio.open", .system_errno = errno };
         goto done;
     }
-    const char *operation = stage(temp, output, length, &original);
+    const char *operation = stage(temp, output, length, &original, original.st_mode & 0777);
     if (operation) {
         *error = (struct config_error){ .step = operation, .system_errno = errno, .target = "temporal-config" };
         goto done;
     }
     temp_ready = 1;
-    operation = stage(backup_temp, input, size, &original);
+    operation = stage(backup_temp, input, size, &original, 0600);
     if (operation) {
         *error = (struct config_error){ .step = operation, .system_errno = errno, .target = "temporal-respaldo" };
         goto done;

@@ -94,7 +94,8 @@ def check(path, port):
     expected = expected.replace('"original"', '"Jugador_1"').replace('"activo"', '"Jugador_1"')
     assert path.read_text() == expected
     assert backup.read_text() == ORIGINAL
-    assert stat.S_IMODE(path.stat().st_mode) == stat.S_IMODE(backup.stat().st_mode) == 0o640
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
 
     request("POST", "/v1/preview", 200, origin=self_origin, media=media, body=submitted)
     assert backup.read_text() == ORIGINAL
