@@ -75,6 +75,7 @@ def check(path, port):
         assert "data-auto='0'" in request("GET", prepare, 200, referer=referer)
     assert "data-auto='1'" in request("GET", prepare, 200, referer=self_origin + "/")
     rooms_origin = "https://eden-rooms.pages.dev"
+    assert f"href='{rooms_origin}/'" in request("GET", prepare, 200)
     assert "data-auto='1'" in request("GET", prepare, 200, referer=rooms_origin + "/")
     for referer in (rooms_origin + ".example/", rooms_origin + "/other", "http://eden-rooms.pages.dev/"):
         assert "data-auto='0'" in request("GET", prepare, 200, referer=referer)

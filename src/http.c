@@ -502,7 +502,7 @@ static void serve(int fd)
             "<a href='%s/'>volver a Eden Rooms</a>.</p>"
             "<script src='/save.js' defer></script></html>",
             room.host, room.port, message, automatic, room.host, room.port, new_submission(), room.nick,
-            from_rooms ? ROOMS_ORIGIN : ORIGIN);
+            referred_by(req.referer, ORIGIN) ? ORIGIN : ROOMS_ORIGIN);
         reply(fd, 200, body, PAGE, 0);
         return;
     }
