@@ -7,6 +7,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #endif
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,11 +24,19 @@
 #define CONFIG "/data/prosperoeden/config/prosperoeden.json"
 #define MAX_HEADER 8192
 #define MAX_BODY 2048
+#define REQUEST_TIMEOUT_MS 5000
+#define VERSION "v0.3.3-experimental"
+#ifdef EDEN_PS5
+#define PLATFORM "ps5"
+#else
+#define PLATFORM "linux"
+#endif
 
 /* The server handles one request at a time. Keep the most recent form results
  * so a retry after a lost response cannot replay the write or notification. */
 static struct submission {
     char token[33];
+    struct room room;
     int result;
 } submissions[64];
 static size_t next_submission;
@@ -98,6 +107,7 @@ static void reply(int fd, int status, const char *body, enum content content, in
     case 204: reason = "No Content"; break;
     case 403: reason = "Forbidden"; break;
     case 404: reason = "Not Found"; break;
+    case 408: reason = "Request Timeout"; break;
     case 409: reason = "Conflict"; break;
     case 500: reason = "Internal Server Error"; break;
     default: reason = "Bad Request"; break;
@@ -143,35 +153,66 @@ static int decimal(const char *text, size_t max, int *result)
     return 0;
 }
 
-static ssize_t receive(int fd, char *buffer, size_t size, time_t deadline)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) || now.tv_sec >= deadline)
-        return -1;
-    ssize_t count = recv(fd, buffer, size, 0);
-    if (count <= 0 || memchr(buffer, 0, (size_t)count))
-        return -1;
-    return count;
-}
-
-static int read_request(int fd, char *buffer, struct request *req)
+static int64_t monotonic_ms(void)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now))
         return -1;
-    time_t deadline = now.tv_sec + 5;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static ssize_t receive(int fd, char *buffer, size_t size, int64_t deadline,
+                       const char **error)
+{
+    struct pollfd socket = { .fd = fd, .events = POLLIN };
+    for (;;) {
+        int64_t now = monotonic_ms();
+        if (now < 0) {
+            *error = "clock";
+            return -1;
+        }
+        int ready = now < deadline ? poll(&socket, 1, (int)(deadline - now)) : 0;
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0) {
+            *error = ready == 0 ? "timeout" : "poll";
+            return -1;
+        }
+        ssize_t count = recv(fd, buffer, size, MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (count <= 0 || memchr(buffer, 0, (size_t)count)) {
+            *error = count == 0 ? "eof" : count < 0 ? "recv" : "nul";
+            return -1;
+        }
+        return count;
+    }
+}
+
+static int read_request(int fd, char *buffer, struct request *req,
+                        const char **stage, const char **error)
+{
+    int64_t now = monotonic_ms();
+    if (now < 0) {
+        *error = "clock";
+        return -1;
+    }
+    int64_t deadline = now + REQUEST_TIMEOUT_MS;
     size_t used = 0;
     char *end = NULL;
     while (!end && used < MAX_HEADER) {
-        ssize_t n = receive(fd, buffer + used, MAX_HEADER - used, deadline);
+        ssize_t n = receive(fd, buffer + used, MAX_HEADER - used, deadline, error);
         if (n < 0)
             return -1;
         used += (size_t)n;
         buffer[used] = 0;
         end = strstr(buffer, "\r\n\r\n");
     }
-    if (!end)
+    if (!end) {
+        *error = "header_limit";
         return -1;
+    }
+    *stage = "header_syntax";
     req->body = end + 4;
     char *line = strstr(buffer, "\r\n");
     *line = 0;
@@ -222,6 +263,9 @@ static int read_request(int fd, char *buffer, struct request *req)
         if (slot && header_value(slot, value))
             return -1;
     }
+    *stage = "content_length";
+    if (!length && !strcmp(req->method, "POST"))
+        return -1;
     int body_size = 0;
     if (length && (decimal(length, 4, &body_size) || body_size > MAX_BODY))
         return -1;
@@ -229,8 +273,9 @@ static int read_request(int fd, char *buffer, struct request *req)
     size_t total = offset + (size_t)body_size;
     if (used > total)
         return -1;
+    *stage = "body";
     while (used < total) {
-        ssize_t n = receive(fd, buffer + used, total - used, deadline);
+        ssize_t n = receive(fd, buffer + used, total - used, deadline, error);
         if (n < 0)
             return -1;
         used += (size_t)n;
@@ -288,11 +333,12 @@ static int form(char *text, struct room *room, const char **token)
     return 0;
 }
 
-static const char *new_submission(void)
+static const char *new_submission(const struct room *room)
 {
     struct submission *entry = &submissions[next_submission];
     next_submission = (next_submission + 1) % (sizeof submissions / sizeof *submissions);
     entry->result = 0;
+    entry->room = *room;
     unsigned char random[16];
     arc4random_buf(random, sizeof random);
     for (size_t i = 0; i < sizeof random; i++)
@@ -339,7 +385,25 @@ static const char save_script[] =
     "  form.elements.nick.value = previous.nick;\n"
     "  form.elements.nick.readOnly = true;\n"
     "}\n"
+    "const opener = window.opener;\n"
+    "const roomsOrigin = '" ROOMS_ORIGIN "';\n"
     "let saving = false;\n"
+    "async function submit(data) {\n"
+    "  for (let attempt = 0; ; attempt++) {\n"
+    "    const controller = new AbortController();\n"
+    "    const timeout = setTimeout(() => controller.abort(), 12000);\n"
+    "    try {\n"
+    "      const response = await fetch(form.action, {method: 'POST', body: data, signal: controller.signal});\n"
+    "      if ([408, 502, 503, 504].includes(response.status) && attempt === 0) continue;\n"
+    "      const result = await response.json();\n"
+    "      if (!response.ok || result.saved !== true) throw new Error(result.error);\n"
+    "      return;\n"
+    "    } catch (error) {\n"
+    "      if (attempt || !(error instanceof TypeError || error.name === 'AbortError' ||\n"
+    "                       error instanceof SyntaxError)) throw error;\n"
+    "    } finally { clearTimeout(timeout); }\n"
+    "  }\n"
+    "}\n"
     "async function save() {\n"
     "  if (saving || !form.reportValidity()) return;\n"
     "  saving = true;\n"
@@ -350,14 +414,15 @@ static const char save_script[] =
     "    const data = new URLSearchParams(new FormData(form));\n"
     "    form.elements.nick.readOnly = true;\n"
     "    try { history.replaceState({confirm: data.get('confirm'), nick: data.get('nick')}, ''); } catch {}\n"
-    "    const response = await fetch(form.action, {method: 'POST', body: data});\n"
-    "    const result = await response.json();\n"
-    "    if (!response.ok || result.saved !== true) throw new Error(result.error);\n"
+    "    await submit(data);\n"
     "    form.hidden = true;\n"
     "    status.textContent = 'Sala guardada correctamente';\n"
-    "    setTimeout(() => { back.hidden = false; window.close(); }, 1000);\n"
+    "    back.hidden = false;\n"
+    "    if (opener) opener.postMessage({type: 'eden-bridge:saved', host: data.get('host'),\n"
+    "      port: data.get('port'), nick: data.get('nick')}, roomsOrigin);\n"
+    "    window.close();\n"
     "  } catch (error) {\n"
-    "    status.textContent = error instanceof TypeError ?\n"
+    "    status.textContent = error instanceof TypeError || error.name === 'AbortError' || error instanceof SyntaxError ?\n"
     "      'No se recibió la confirmación del puente. Comprobá la conexión con la PS5.' :\n"
     "      error.message || 'El puente devolvió una respuesta inesperada.';\n"
     "    saving = false;\n"
@@ -369,9 +434,7 @@ static const char save_script[] =
     "button.disabled = false;\n"
     "if (form.dataset.auto === '1' && form.checkValidity()) {\n"
     "  save();\n"
-    "} else if (window.opener && form.checkValidity()) {\n"
-    "  const opener = window.opener;\n"
-    "  const roomsOrigin = '" ROOMS_ORIGIN "';\n"
+    "} else if (opener && form.checkValidity()) {\n"
     "  function authorize(event) {\n"
     "    if (event.origin !== roomsOrigin || event.source !== opener ||\n"
     "        event.data?.type !== 'eden-bridge:send-room') return;\n"
@@ -380,7 +443,6 @@ static const char save_script[] =
     "        nick !== form.elements.nick.value) return;\n"
     "    window.removeEventListener('message', authorize);\n"
     "    clearTimeout(timeout);\n"
-    "    window.opener = null;\n"
     "    back.querySelector('a').href = roomsOrigin + '/';\n"
     "    save();\n"
     "  }\n"
@@ -417,8 +479,14 @@ static void serve(int fd)
     char buffer[MAX_HEADER + MAX_BODY + 1], body[2048];
     struct request req = {0};
     struct room room = {0};
-    if (read_request(fd, buffer, &req)) {
-        reply(fd, 400, "{\"ok\":false,\"error\":\"invalid request\"}", JSON, 0);
+    const char *stage = "headers", *error = "invalid";
+    if (read_request(fd, buffer, &req, &stage, &error)) {
+        int timeout = !strcmp(error, "timeout");
+        fprintf(stderr, "Eden Bridge %s HTTP: %s/%s\n", VERSION, stage, error);
+        snprintf(body, sizeof body, "{\"ok\":false,\"error\":\"%s\","
+                 "\"stage\":\"%s\",\"code\":\"%s\"}",
+                 timeout ? "Tiempo de espera al leer la solicitud." : "invalid request", stage, error);
+        reply(fd, timeout ? 408 : 400, body, JSON, 0);
         return;
     }
 
@@ -451,6 +519,12 @@ static void serve(int fd)
     int preview = !strcmp(req.target, "/v1/preview");
     int connection = !strcmp(req.target, "/v1/connection");
     int health = !strcmp(req.target, "/v1/health");
+    int version = !strcmp(req.target, "/v1/version");
+    if (!strcmp(req.method, "GET") && version && !query) {
+        reply(fd, 200, "{\"ok\":true,\"service\":\"eden-bridge\",\"version\":\"" VERSION
+              "\",\"platform\":\"" PLATFORM "\"}", JSON, external);
+        return;
+    }
     if (!strcmp(req.method, "GET") && health && !query) {
         reply(fd, 200, "{\"ok\":true,\"service\":\"eden-bridge\",\"writeEnabled\":false}", JSON, external);
         return;
@@ -501,12 +575,12 @@ static void serve(int fd)
             "<p id='back' hidden>Podés cerrar esta pestaña o "
             "<a href='%s/'>volver a Eden Rooms</a>.</p>"
             "<script src='/save.js' defer></script></html>",
-            room.host, room.port, message, automatic, room.host, room.port, new_submission(), room.nick,
+            room.host, room.port, message, automatic, room.host, room.port, new_submission(&room), room.nick,
             referred_by(req.referer, ORIGIN) ? ORIGIN : ROOMS_ORIGIN);
         reply(fd, 200, body, PAGE, 0);
         return;
     }
-    if (!strcmp(req.method, "OPTIONS") && !query && (preview || connection || health)) {
+    if (!strcmp(req.method, "OPTIONS") && !query && (preview || connection || health || version)) {
         reply(fd, external ? 204 : 403, "", JSON, external);
         return;
     }
@@ -525,26 +599,35 @@ static void serve(int fd)
             reply(fd, 403, "{\"saved\":false,\"error\":\"Confirmación inválida o vencida. Volvé a abrir la sala.\"}", JSON, 0);
             return;
         }
+        if (strcmp(entry->room.host, room.host) || entry->room.port != room.port ||
+            (entry->result != 0 && strcmp(entry->room.nick, room.nick))) {
+            reply(fd, 409, "{\"saved\":false,\"error\":\"La confirmación corresponde a otros datos. Volvé a abrir la sala.\"}", JSON, 0);
+            return;
+        }
         if (entry->result == 0) {
             struct config_error error;
             int saved = config_update(config, &room, &error);
             if (saved < 0) {
                 config_failure(body, sizeof body, &error, saved, 1);
-                if (saved == -2)
+                if (saved == -2) {
+                    entry->room = room;
                     entry->result = saved;
+                }
                 reply(fd, saved == -2 ? 500 : 409, body, JSON, 0);
                 return;
             }
+            entry->room = room;
             entry->result = saved;
-            if (saved > 0) {
-                snprintf(body, sizeof body, "Eden Bridge: %s - sala %s:%d guardada", room.nick, room.host, room.port);
-                notify(body);
-            }
+            reply(fd, 200, "{\"ok\":true,\"saved\":true}", JSON, 0);
+            snprintf(body, sizeof body, "Eden Bridge: %s - sala %s:%d guardada", room.nick, room.host, room.port);
+            notify(body);
+            return;
         }
         if (entry->result == -2) {
             reply(fd, 500, "{\"saved\":false,\"error\":\"Se reemplazó la configuración, pero no se pudo confirmar su persistencia. Revisá el archivo y el respaldo.\"}", JSON, 0);
             return;
         }
+        fprintf(stderr, "Eden Bridge %s: confirmación repetida\n", VERSION);
         reply(fd, 200, "{\"ok\":true,\"saved\":true}", JSON, 0);
         return;
     }
@@ -599,6 +682,7 @@ int main(int argc, char **argv)
             close(listener);
         return 1;
     }
+    fprintf(stderr, "Eden Bridge %s (%s)\n", VERSION, PLATFORM);
     notify_started(port);
     for (;;) {
         int fd = accept(listener, NULL, NULL);
@@ -609,8 +693,7 @@ int main(int argc, char **argv)
             break;
         }
         struct timeval timeout = { .tv_sec = 2 };
-        if (!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) &&
-            !setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout))
+        if (!setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout))
             serve(fd);
         close(fd);
     }

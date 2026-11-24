@@ -1,5 +1,6 @@
 """Ejercita el servidor C sobre una configuración temporal en loopback."""
 
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 from pathlib import Path
@@ -51,6 +52,10 @@ def check(path, port):
             with_connection.close()
 
     assert json.loads(request("GET", "/v1/health", 200))["service"] == "eden-bridge"
+    version = json.loads(request("GET", "/v1/version", 200, origin=ORIGIN))
+    assert version == {"ok": True, "service": "eden-bridge",
+                       "version": "v0.3.3-experimental", "platform": "linux"}
+    request("GET", "/v1/version", 403, origin="https://other.test")
     request("GET", "/", 200)
     request("GET", "/", 403, host=f"rebind.test:{port}")
     assert json.loads(request("GET", "/v1/config-check", 200))["multiplayerSections"] == 2
@@ -88,8 +93,28 @@ def check(path, port):
     request("POST", "/v1/preview", 403, origin=ORIGIN, media=media, body=submitted)
     assert path.read_text() == ORIGINAL and not backup.exists()
 
+    def post_header(size):
+        return (f"POST /v1/preview HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"Origin: {self_origin}\r\nContent-Type: {media}\r\n"
+                f"Content-Length: {size}\r\n\r\n").encode()
+
+    request("POST", "/v1/preview", 409, origin=self_origin, media=media,
+            body=urlencode(dict(room, port=99, confirm=token)))
+    wire_body = submitted.encode()
+    with socket.create_connection(("127.0.0.1", port), timeout=7) as sock:
+        header = post_header(len(wire_body))
+        sock.sendall(header[:-3])
+        time.sleep(0.03)
+        sock.sendall(header[-3:] + wire_body[:5])
+        time.sleep(2.2)
+        sock.sendall(wire_body[5:])
+        # Discard the first response body and resend the same token.
+        with sock.makefile("rb") as response:
+            assert response.readline().startswith(b"HTTP/1.1 200")
     assert json.loads(request("POST", "/v1/preview", 200, origin=self_origin,
                               media=media, body=submitted))["saved"] is True
+    request("POST", "/v1/preview", 409, origin=self_origin, media=media,
+            body=urlencode(dict(room, nick="Distinto", confirm=token)))
     expected = ORIGINAL.replace('"192.0.2.11"', '"192.0.2.100"').replace('"192.0.2.12"', '"192.0.2.100"')
     expected = expected.replace('"port":1,', '"port":24872,').replace('"port":2}', '"port":24872}')
     expected = expected.replace('"original"', '"Jugador_1"').replace('"activo"', '"Jugador_1"')
@@ -153,7 +178,34 @@ def check(path, port):
     assert path.read_text() == json.dumps(current, indent=2) + "\n"
     assert backup.read_text() == modern
 
+    # A truncated body must never consume a new token or change the backup.
+    page = request("GET", prepare, 200)
+    token = re.search(r"name='confirm' value='([a-f0-9]{32})'", page)[1]
+    truncated = urlencode(dict(room, confirm=token)).encode()
+    for eof, status, code in ((True, 400, "eof"), (False, 408, "timeout")):
+        with socket.create_connection(("127.0.0.1", port), timeout=7) as sock:
+            sock.sendall(post_header(len(truncated)) + truncated[:-1])
+            if eof:
+                sock.shutdown(socket.SHUT_WR)
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            assert response.status == status
+            diagnostic = json.loads(response.read())
+            assert diagnostic["stage"] == "body" and diagnostic["code"] == code
+    assert backup.read_text() == modern
+    path.write_text(modern)
+
+    def duplicate_save():
+        return request("POST", "/v1/preview", 200, origin=self_origin, media=media, body=truncated)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [pool.submit(duplicate_save) for _ in range(2)]
+        assert all(json.loads(result.result())["saved"] is True for result in results)
+    assert backup.read_text() == modern
+    assert path.read_text() == json.dumps(current, indent=2) + "\n"
+
     raw_headers = [
+        b"Content-Type: application/json",
         b"Origin: " + ORIGIN.encode() + b"\r\nOrigin: " + ORIGIN.encode(),
         b"Content-Length: 0\r\nContent-Length: 0",
         b"Transfer-Encoding: chunked",
