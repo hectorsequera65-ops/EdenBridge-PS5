@@ -19,6 +19,7 @@
 
 #define PORT 24879
 #define ORIGIN "https://eden-rooms-ps5.pages.dev"
+#define ROOMS_ORIGIN "https://eden-rooms.pages.dev"
 #define CONFIG "/data/prosperoeden/config/prosperoeden.json"
 #define MAX_HEADER 8192
 #define MAX_BODY 2048
@@ -366,7 +367,27 @@ static const char save_script[] =
     "}\n"
     "form.addEventListener('submit', event => { event.preventDefault(); save(); });\n"
     "button.disabled = false;\n"
-    "if (form.dataset.auto === '1' && form.checkValidity()) save();\n";
+    "if (form.dataset.auto === '1' && form.checkValidity()) {\n"
+    "  save();\n"
+    "} else if (window.opener && form.checkValidity()) {\n"
+    "  const opener = window.opener;\n"
+    "  const roomsOrigin = '" ROOMS_ORIGIN "';\n"
+    "  function authorize(event) {\n"
+    "    if (event.origin !== roomsOrigin || event.source !== opener ||\n"
+    "        event.data?.type !== 'eden-bridge:send-room') return;\n"
+    "    const {host, port, nick} = event.data;\n"
+    "    if (host !== form.elements.host.value || port !== form.elements.port.value ||\n"
+    "        nick !== form.elements.nick.value) return;\n"
+    "    window.removeEventListener('message', authorize);\n"
+    "    clearTimeout(timeout);\n"
+    "    window.opener = null;\n"
+    "    back.querySelector('a').href = roomsOrigin + '/';\n"
+    "    save();\n"
+    "  }\n"
+    "  const timeout = setTimeout(() => window.removeEventListener('message', authorize), 15000);\n"
+    "  window.addEventListener('message', authorize);\n"
+    "  opener.postMessage({type: 'eden-bridge:ready'}, roomsOrigin);\n"
+    "}\n";
 
 static int media(const char *header, const char *type)
 {
